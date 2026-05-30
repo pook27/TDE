@@ -73,6 +73,7 @@ use std::{
     mem,
     sync::{Arc, Mutex},
     time::Duration,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -88,7 +89,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, List, ListItem, ListState},
     Terminal,
 };
 use tokio::sync::mpsc;
@@ -109,6 +110,7 @@ enum AppEvent {
     PtyOutput { pane_id: PaneId, bytes: Vec<u8> },
     PtyExited { pane_id: PaneId },
     Input(Event),
+    ExplorerUpdate { pane_id: PaneId, path: PathBuf, entries: Vec<ExplorerEntry> },
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -173,6 +175,41 @@ impl TerminalPane {
         *g = vt100::Parser::new(rows, cols, 0);
         Ok(())
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 6.5  Explorer & Generic Panes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone)]
+struct ExplorerEntry {
+    name: String,
+    is_dir: bool,
+}
+
+struct ExplorerPane {
+    id: PaneId,
+    cwd: PathBuf,
+    entries: Vec<ExplorerEntry>,
+    list_state: ListState,
+}
+
+impl ExplorerPane {
+    fn new(id: PaneId, path: PathBuf) -> Self {
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        Self {
+            id,
+            cwd: path,
+            entries: Vec::new(),
+            list_state,
+        }
+    }
+}
+
+enum AppPane {
+    Terminal(TerminalPane),
+    Explorer(ExplorerPane),
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -450,7 +487,7 @@ impl LayoutNode {
 
 struct AppState {
     layout:  LayoutNode,
-    panes:   HashMap<PaneId, TerminalPane>,
+    panes:   HashMap<PaneId, AppPane>,
     focus:   PaneId,
     next_id: PaneId,
 }
@@ -464,7 +501,7 @@ impl AppState {
 
         let (pane, reader) = TerminalPane::new(id, rows, cols)?;
         let mut panes = HashMap::new();
-        panes.insert(id, pane);
+        panes.insert(id, AppPane::Terminal(pane));
 
         Ok((
             Self {
@@ -539,20 +576,46 @@ impl AppState {
         let (rows, cols) = self.new_pane_size(area, kind);
 
         let (pane, reader) = TerminalPane::new(new_id, rows, cols)?;
-        self.panes.insert(new_id, pane);
+        self.panes.insert(new_id, AppPane::Terminal(pane));
 
         // Mutate the tree: replace Pane(focus) with Split{Pane(focus), Pane(new)}.
         self.layout.split_pane(self.focus, new_id, kind);
 
         // Also resize the *existing* focused pane to its new (halved) rect.
-        if let Some(existing) = self.panes.get_mut(&self.focus) {
-            existing.resize(rows, cols)?;
+        if let Some(AppPane::Terminal(existing_term)) = self.panes.get_mut(&self.focus) {
+            existing_term.resize(rows, cols)?;
         }
 
         // Shift focus to the newly created pane.
         self.focus = new_id;
 
         Ok((new_id, reader))
+    }
+
+    /// Split the focused pane and spawn a File Explorer
+    fn do_split_explorer(&mut self, area: Rect, kind: SplitKind, tx: mpsc::Sender<AppEvent>) -> Result<()> {
+        let new_id = self.next_id;
+        self.next_id += 1;
+
+        let (rows, cols) = self.new_pane_size(area, kind);
+        
+        // Start at user's home dir or root
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
+        let explorer = ExplorerPane::new(new_id, home.clone());
+        
+        self.panes.insert(new_id, AppPane::Explorer(explorer));
+        self.layout.split_pane(self.focus, new_id, kind);
+
+        if let Some(AppPane::Terminal(existing)) = self.panes.get_mut(&self.focus) {
+            existing.resize(rows, cols)?;
+        }
+
+        self.focus = new_id;
+        
+        // Trigger initial async read
+        spawn_dir_read(new_id, home, tx);
+
+        Ok(())
     }
 
     /// Compute the PTY size that a newly created pane will have after splitting
@@ -646,8 +709,8 @@ impl AppState {
         for (id, rect) in rects {
             let rows = rect.height.saturating_sub(2).max(2);
             let cols = rect.width.saturating_sub(2).max(8);
-            if let Some(pane) = self.panes.get_mut(&id) {
-                pane.resize(rows, cols)?;
+            if let Some(AppPane::Terminal(term)) = self.panes.get_mut(&id) {
+                term.resize(rows, cols)?;
             }
         }
         Ok(())
@@ -735,6 +798,32 @@ fn spawn_pane_reader(
     });
 }
 
+fn spawn_dir_read(pane_id: PaneId, path: PathBuf, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let mut entries = Vec::new();
+        
+        // Always add a way to go up a directory, unless we are at root
+        if path.parent().is_some() {
+            entries.push(ExplorerEntry { name: "..".to_string(), is_dir: true });
+        }
+
+        if let Ok(mut read_dir) = tokio::fs::read_dir(&path).await {
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                entries.push(ExplorerEntry { name, is_dir });
+            }
+        }
+        
+        // Sort: Directories first, then alphabetical
+        entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
+        });
+
+        let _ = tx.send(AppEvent::ExplorerUpdate { pane_id, path, entries }).await;
+    });
+}
+
 async fn input_task(tx: mpsc::Sender<AppEvent>) {
     let mut stream = EventStream::new();
     loop {
@@ -807,7 +896,7 @@ fn dispatch_input(
     state: &mut AppState,
     area: Rect,
     key: KeyEvent,
-    _tx: &mpsc::Sender<AppEvent>, // Prefix unused with an underscore since we don't need it right now
+    tx: &mpsc::Sender<AppEvent>, // Prefix unused with an underscore since we don't need it right now
 ) -> Result<(bool, Option<(PaneId, Box<dyn Read + Send>)>)> {
     
     // Check if the ALT modifier is pressed
@@ -841,16 +930,54 @@ fn dispatch_input(
                 return Ok((should_quit, None));
             }
 
+            // ── Split Explorer ──────────────────────────────────────────────
+            KeyCode::Char('e') => {
+                state.do_split_explorer(area, SplitKind::Vertical, tx.clone())?;
+                return Ok((false, None)); // tx handles async data
+            }
+
             // Ignore other Alt bindings
             _ => {}
         }
     } else {
-        // Passthrough: If Alt is not pressed, forward everything to the PTY
+        // Passthrough: If Alt is not pressed, handle based on pane type
         if let Some(pane) = state.panes.get_mut(&state.focus) {
-            forward_key(key, &mut pane.writer)?;
+            match pane {
+                AppPane::Terminal(term) => {
+                    forward_key(key, &mut term.writer)?;
+                }
+                AppPane::Explorer(exp) => {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            let i = exp.list_state.selected().unwrap_or(0);
+                            if i < exp.entries.len().saturating_sub(1) { exp.list_state.select(Some(i + 1)); }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            let i = exp.list_state.selected().unwrap_or(0);
+                            if i > 0 { exp.list_state.select(Some(i - 1)); }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(i) = exp.list_state.selected() {
+                                if let Some(entry) = exp.entries.get(i) {
+                                    if entry.is_dir {
+                                        let mut new_path = exp.cwd.clone();
+                                        if entry.name == ".." {
+                                            new_path.pop();
+                                        } else {
+                                            new_path.push(&entry.name);
+                                        }
+                                        // Request new dir data
+                                        spawn_dir_read(exp.id, new_path, tx.clone());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
-
     Ok((false, None))
 }
 
@@ -922,6 +1049,8 @@ fn draw(
             Span::styled("close │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+H/J/K/L ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("focus │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+E ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("explorer │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+Q ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("quit", Style::default().fg(theme::DIM_TEXT)),
         ]);
@@ -961,8 +1090,27 @@ fn draw(
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
 
-            let guard = pane.parser.lock().expect("parser poisoned");
-            frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
+            match pane {
+                AppPane::Terminal(term) => {
+                    let guard = term.parser.lock().expect("parser poisoned");
+                    frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
+                }
+                AppPane::Explorer(exp) => {
+                    let items: Vec<ListItem> = exp.entries.iter().map(|e| {
+                        let icon = if e.is_dir { "📁" } else { "📄" };
+                        let style = if e.is_dir { Style::default().fg(Color::Blue) } else { Style::default() };
+                        ListItem::new(format!(" {} {}", icon, e.name)).style(style)
+                    }).collect();
+
+                    let list = List::new(items)
+                        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                        .highlight_symbol(">> ");
+
+                    // We need a mutable reference to state to render the selection highlight
+                    let mut state = exp.list_state.clone(); 
+                    frame.render_stateful_widget(list, inner, &mut state);
+                }
+            }
         }
     })?;
     Ok(())
@@ -994,9 +1142,18 @@ async fn run_event_loop(
         match event {
             // ── PTY output ────────────────────────────────────────────────
             AppEvent::PtyOutput { pane_id, bytes } => {
-                // Guard against output from already-removed panes.
-                if let Some(pane) = state.panes.get(&pane_id) {
-                    pane.parser.lock().expect("parser poisoned").process(&bytes);
+                // Guard against output from already-removed panes, and ensure it's a terminal
+                if let Some(AppPane::Terminal(term)) = state.panes.get(&pane_id) {
+                    term.parser.lock().expect("parser poisoned").process(&bytes);
+                }
+                draw(terminal, state)?;
+            }
+
+            AppEvent::ExplorerUpdate { pane_id, path, entries } => {
+                if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&pane_id) {
+                    exp.cwd = path;
+                    exp.entries = entries;
+                    exp.list_state.select(Some(0)); // Reset selection to top
                 }
                 draw(terminal, state)?;
             }
