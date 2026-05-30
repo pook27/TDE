@@ -107,7 +107,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, List, ListItem, ListState},
+    widgets::{Block, Borders, Paragraph, List, ListItem, ListState, Clear},
     Terminal,
 };
 use tokio::sync::mpsc;
@@ -204,10 +204,10 @@ impl Drop for TerminalPane {
         // close its own file descriptors cleanly, avoiding OS-level PTY panics.
         let _ = self.writer.write_all(b"\x1b:qa!\r");
         let _ = self.writer.flush();
-        
+
         // Give the process a brief window to exit gracefully
         std::thread::sleep(std::time::Duration::from_millis(50));
-        
+
         // Force kill as a fallback if it was unresponsive
         dlog(&format!("TerminalPane::drop killing pane_id={}", self.id));
         let _ = self._child.kill();
@@ -523,11 +523,25 @@ impl LayoutNode {
 // § 8  AppState
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[derive(Clone)]
+enum OverlayAction {
+    /// Alt+Space to spawn a custom command
+    SpawnCommand,
+    /// 'c' in Explorer to create a file/directory
+    CreateFile { cwd: PathBuf },
+}
+
+struct AppOverlay {
+    action: OverlayAction,
+    input: String,
+}
+
 struct AppState {
     layout:  LayoutNode,
     panes:   HashMap<PaneId, AppPane>,
     focus:   PaneId,
     next_id: PaneId,
+    overlay: Option<AppOverlay>,
 }
 
 impl AppState {
@@ -542,13 +556,14 @@ impl AppState {
         panes.insert(id, AppPane::Terminal(pane));
 
         Ok((
-            Self {
-                layout:  LayoutNode::Pane(id),
-                panes,
-                focus:   id,
-                next_id: 1,
-            },
-            reader,
+                Self {
+                    layout:  LayoutNode::Pane(id),
+                    panes,
+                    focus:   id,
+                    next_id: 1,
+                    overlay: None,
+                },
+                reader,
         ))
     }
 
@@ -596,6 +611,40 @@ impl AppState {
         }
     }
 
+    // ── Smart split heuristic ────────────────────────────────────────────────
+
+    /// Determines the best split direction based on the focused pane's current dimensions.
+    fn smart_split_kind(&self, area: Rect, preferred: SplitKind) -> SplitKind {
+        let mut rects = Vec::new();
+        self.layout.collect_pane_rects(area, &mut rects);
+        let focus_rect = rects
+            .iter()
+            .find(|(id, _)| *id == self.focus)
+            .map(|(_, r)| *r)
+            .unwrap_or(area);
+
+        // Terminal fonts are usually ~2x as tall as they are wide. 
+        // 45 cols is very narrow. 12 rows is very short.
+        match preferred {
+            SplitKind::Vertical => {
+                // Prefers left/right split. Override if we are too narrow but have height.
+                if focus_rect.width < 45 && focus_rect.height >= 12 {
+                    SplitKind::Horizontal
+                } else {
+                    SplitKind::Vertical
+                }
+            }
+            SplitKind::Horizontal => {
+                // Prefers top/bottom split. Override if we are too short but have width.
+                if focus_rect.height < 12 && focus_rect.width >= 45 {
+                    SplitKind::Vertical
+                } else {
+                    SplitKind::Horizontal
+                }
+            }
+        }
+    }
+
     // ── Dynamic split ────────────────────────────────────────────────────────
 
     /// Split the focused pane and return the new pane's reader for thread
@@ -634,11 +683,11 @@ impl AppState {
         self.next_id += 1;
 
         let (rows, cols) = self.new_pane_size(area, kind);
-        
+
         // Start at user's home dir or root
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
         let explorer = ExplorerPane::new(new_id, home.clone());
-        
+
         self.panes.insert(new_id, AppPane::Explorer(explorer));
         self.layout.split_pane(self.focus, new_id, kind);
 
@@ -647,7 +696,7 @@ impl AppState {
         }
 
         self.focus = new_id;
-        
+
         // Trigger initial async read
         spawn_dir_read(new_id, home, tx);
 
@@ -768,11 +817,32 @@ impl AppState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 9  Geometry helpers (unchanged from Phase 2)
+// § 9  Geometry helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn centroid_x(r: Rect) -> i32 { (r.x as i32) + (r.width  as i32) / 2 }
 fn centroid_y(r: Rect) -> i32 { (r.y as i32) + (r.height as i32) / 2 }
+
+/// Helper to create a centered bounding box for floating overlays
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
 
 fn ranges_overlap_v(a: Rect, b: Rect) -> bool {
     (a.y as i32) < (b.y + b.height) as i32
@@ -863,7 +933,7 @@ fn spawn_pane_reader(
 fn spawn_dir_read(pane_id: PaneId, path: PathBuf, tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
         let mut entries = Vec::new();
-        
+
         // Always add a way to go up a directory, unless we are at root
         if path.parent().is_some() {
             entries.push(ExplorerEntry { name: "..".to_string(), is_dir: true });
@@ -876,7 +946,7 @@ fn spawn_dir_read(pane_id: PaneId, path: PathBuf, tx: mpsc::Sender<AppEvent>) {
                 entries.push(ExplorerEntry { name, is_dir });
             }
         }
-        
+
         // Sort: Directories first, then alphabetical
         entries.sort_by(|a, b| {
             b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
@@ -985,14 +1055,73 @@ fn dispatch_input(
     key: KeyEvent,
     tx: &mpsc::Sender<AppEvent>, // Prefix unused with an underscore since we don't need it right now
 ) -> Result<(bool, Option<(PaneId, Box<dyn Read + Send>)>)> {
-    
+
     dlog(&format!(
-        "dispatch_input: key={:?} modifiers={:?} focus={} panes={:?}",
-        key.code,
-        key.modifiers,
-        state.focus,
-        state.panes.keys().collect::<Vec<_>>()
+            "dispatch_input: key={:?} modifiers={:?} focus={} panes={:?}",
+            key.code,
+            key.modifiers,
+            state.focus,
+            state.panes.keys().collect::<Vec<_>>()
     ));
+
+    // ── 1. Intercept input if Overlay is active ──────────────────────────────
+    if let Some(mut overlay) = state.overlay.take() {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel overlay (state.overlay remains None)
+            }
+            KeyCode::Backspace => {
+                overlay.input.pop();
+                state.overlay = Some(overlay);
+            }
+            KeyCode::Char(c) => {
+                overlay.input.push(c);
+                state.overlay = Some(overlay);
+            }
+            KeyCode::Enter => {
+                // Execute the overlay action!
+                match overlay.action {
+                    OverlayAction::SpawnCommand => {
+                        if !overlay.input.trim().is_empty() {
+                            // Basic command parsing (splits by space)
+                            let mut parts = overlay.input.trim().split_whitespace();
+                            let mut cmd = CommandBuilder::new(parts.next().unwrap());
+                            for arg in parts { cmd.arg(arg); }
+                            cmd.env("TERM", "xterm-256color");
+
+                            // Smart split: prefers vertical, but flips to horizontal if cramped
+                            let kind = state.smart_split_kind(area, SplitKind::Vertical);
+                            let (new_id, reader) = state.do_split(area, kind, Some(cmd))?;
+                            return Ok((false, Some((new_id, reader))));
+                        }
+                    }
+                    OverlayAction::CreateFile { cwd } => {
+                        if !overlay.input.trim().is_empty() {
+                            let mut path = cwd.clone();
+                            path.push(overlay.input.trim());
+
+                            // If it ends with '/', make a directory. Otherwise, make an empty file.
+                            if overlay.input.ends_with('/') {
+                                let _ = std::fs::create_dir_all(&path);
+                            } else {
+                                let _ = std::fs::File::create(&path);
+                            }
+
+                            // Trigger an async refresh of the focused Explorer pane
+                            if let Some(AppPane::Explorer(exp)) = state.panes.get(&state.focus) {
+                                spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Ignore other keys but keep overlay open
+                state.overlay = Some(overlay);
+            }
+        }
+        return Ok((false, None));
+    }
 
     // Check if the ALT modifier is pressed
     if key.modifiers.contains(KeyModifiers::ALT) {
@@ -1026,9 +1155,20 @@ fn dispatch_input(
             }
 
             // ── Split Explorer ──────────────────────────────────────────────
-            KeyCode::Char('e') => {
-                state.do_split_explorer(area, SplitKind::Vertical, tx.clone())?;
+           KeyCode::Char('e') => {
+                // Smart split: prefers vertical, but flips to horizontal if cramped
+                let kind = state.smart_split_kind(area, SplitKind::Vertical);
+                state.do_split_explorer(area, kind, tx.clone())?;
                 return Ok((false, None)); // tx handles async data
+            }
+
+            // ── Command Bar Overlay ───────────────────────────────────────
+            KeyCode::Char(' ') => { // Alt + Space
+                state.overlay = Some(AppOverlay {
+                    action: OverlayAction::SpawnCommand,
+                    input: String::new(),
+                });
+                return Ok((false, None));
             }
 
             // Ignore other Alt bindings
@@ -1057,7 +1197,7 @@ fn dispatch_input(
                             let i = exp.list_state.selected().unwrap_or(0);
                             if i > 0 { exp.list_state.select(Some(i - 1)); }
                         }
-                        KeyCode::Char('D') => { // Shift+D to delete
+                        KeyCode::Char('D') => { // shift + 'd' to delete
                             if let Some(i) = exp.list_state.selected() {
                                 if let Some(entry) = exp.entries.get(i) {
                                     if entry.name != ".." {
@@ -1067,6 +1207,12 @@ fn dispatch_input(
                                     }
                                 }
                             }
+                        }
+                        KeyCode::Char('c') => { // 'c' to create
+                            state.overlay = Some(AppOverlay {
+                                action: OverlayAction::CreateFile { cwd: exp.cwd.clone() },
+                                input: String::new(),
+                            });
                         }
                         KeyCode::Enter => {
                             if let Some(i) = exp.list_state.selected() {
@@ -1090,31 +1236,31 @@ fn dispatch_input(
                         _ => {
                             dlog(&format!("dispatch_input: explorer pane swallowed key {:?} (not a handled binding)", key.code));
                         }
-                    } // match key.code
-                }     // AppPane::Explorer
-            }         // match pane
-        }             // if let Some(pane)
+                    }
+                }
+            }
+        }
 
         if let Some((action, path)) = deferred_action {
             if action == "open" {
                 let mut cmd = CommandBuilder::new("nvim");
                 cmd.arg(path.to_string_lossy().as_ref());
                 cmd.env("TERM", "xterm-256color");
-                
+
                 // Split vertically and open nvim
                 let (new_id, reader) = state.do_split(area, SplitKind::Vertical, Some(cmd))?;
                 return Ok((false, Some((new_id, reader))));
-                
+
             } else if action == "delete" {
                 if path.is_dir() {
                     let _ = std::fs::remove_dir_all(&path);
                 } else {
                     let _ = std::fs::remove_file(&path);
                 }
-                
+
                 // Refresh the current explorer pane
                 if let Some(AppPane::Explorer(exp)) = state.panes.get(&state.focus) {
-                     spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
+                    spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
                 }
             }
         }
@@ -1160,42 +1306,60 @@ fn draw(
         // ── Top bar ───────────────────────────────────────────────────────
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " TDE ",
-                    Style::default()
+                    Span::styled(
+                        " TDE ",
+                        Style::default()
                         .fg(theme::TITLE_BADGE_FG)
                         .bg(theme::TITLE_BADGE_BG)
                         .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "  Phase 3 — Dynamic Pane Management",
-                    Style::default().fg(theme::ACCENT),
-                ),
-                // Pane count indicator on the right side gives useful feedback.
-                Span::styled(
-                    format!("  [{} pane(s)]", state.panes.len()),
-                    Style::default().fg(theme::DIM_TEXT),
-                ),
+                    ),
+                    Span::styled(
+                        "  Terminal Desktop Environment",
+                        Style::default().fg(theme::ACCENT),
+                    ),
+                    // Pane count indicator on the right side gives useful feedback.
+                    Span::styled(
+                        format!("  [{} pane(s)]", state.panes.len()),
+                        Style::default().fg(theme::DIM_TEXT),
+                    ),
             ])),
             top_area,
         );
 
-        // ── Bottom status bar ─────────────────────────────────────────────
-        let status = Line::from(vec![
-            Span::styled(" Alt+V ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-            Span::styled("vsplit │", Style::default().fg(theme::DIM_TEXT)),
-            Span::styled(" Alt+S ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-            Span::styled("hsplit │", Style::default().fg(theme::DIM_TEXT)),
+        // ── Bottom status bar (Context-Aware) ─────────────────────────────
+        let is_explorer = matches!(state.panes.get(&state.focus), Some(AppPane::Explorer(_)));
+        
+        let mut hints = Vec::new();
+        
+        // Inject Explorer-specific hints if focused
+        if is_explorer {
+            hints.extend(vec![
+                Span::styled(" c ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                Span::styled("create │", Style::default().fg(theme::DIM_TEXT)),
+                Span::styled(" D ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                Span::styled("delete │", Style::default().fg(theme::DIM_TEXT)),
+                Span::styled(" Enter ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                Span::styled("open │", Style::default().fg(theme::DIM_TEXT)),
+            ]);
+        }
+        
+        // Standard window management hints
+        hints.extend(vec![
+            Span::styled(" Alt+Space ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("cmd │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+E ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("exp │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+V/S ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("split │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+X ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("close │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+H/J/K/L ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("focus │", Style::default().fg(theme::DIM_TEXT)),
-            Span::styled(" Alt+E ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-            Span::styled("explorer │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+Q ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("quit", Style::default().fg(theme::DIM_TEXT)),
         ]);
-        frame.render_widget(Paragraph::new(status), bot_area);
+        
+        frame.render_widget(Paragraph::new(Line::from(hints)), bot_area);
 
         // ── Tiled panes ───────────────────────────────────────────────────
         let mut pane_rects = Vec::new();
@@ -1252,6 +1416,29 @@ fn draw(
                     frame.render_stateful_widget(list, inner, &mut state);
                 }
             }
+        }
+        // ── Draw Overlay (Always on top) ──────────────────────────────────
+        if let Some(overlay) = &state.overlay {
+            // A small centered box: 40% width, 3 lines tall
+            let mut overlay_area = centered_rect(40, 20, full);
+            overlay_area.height = 3; 
+
+            // Clear the background to prevent underlying text from bleeding through
+            frame.render_widget(Clear, overlay_area);
+
+            let title = match overlay.action {
+                OverlayAction::SpawnCommand => " Run Command (Alt+Space) ",
+                OverlayAction::CreateFile { .. } => " Create File/Dir (ends with / for dir) ",
+            };
+
+            let block = Block::default()
+                .title(Span::styled(title, Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::ACCENT));
+
+            // Render the text with a simple block cursor at the end
+            let text = format!(" {}█", overlay.input);
+            frame.render_widget(Paragraph::new(text).block(block), overlay_area);
         }
     })?;
     Ok(())
