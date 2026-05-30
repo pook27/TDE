@@ -1,0 +1,38 @@
+[package]
+name = "tde"
+version = "0.2.0"
+edition = "2024"
+description = "TDE - Terminal Desktop Environment"
+
+[[bin]]
+name = "tde"
+path = "src/main.rs"
+
+[dependencies]
+# Core TUI framework
+ratatui = "0.29"
+
+# Terminal backend and raw input events
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Cross-platform PTY (pseudo-terminal) spawning
+portable-pty = "0.8"
+
+# VT100/ANSI escape-sequence parser that maintains a virtual screen state
+vt100 = "0.15"
+
+# tui-term renders a vt100::Screen into a ratatui Widget
+tui-term = "0.2"
+
+# Async runtime for concurrent PTY I/O + crossterm event reading
+tokio = { version = "1", features = ["full"] }
+
+# Ergonomic error handling
+anyhow = "1"
+
+# StreamExt trait used by crossterm's EventStream
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+strip = true
