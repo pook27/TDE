@@ -112,17 +112,7 @@ enum AppEvent {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 3  Input mode
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum InputMode {
-    Normal,
-    PrefixActive,
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// § 4  Direction
+// § 3  Direction
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, Debug)]
@@ -134,7 +124,7 @@ enum Dir {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 5  Split kind
+// § 4  Split kind
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Which axis to split on.
@@ -462,7 +452,6 @@ struct AppState {
     layout:  LayoutNode,
     panes:   HashMap<PaneId, TerminalPane>,
     focus:   PaneId,
-    mode:    InputMode,
     next_id: PaneId,
 }
 
@@ -482,7 +471,6 @@ impl AppState {
                 layout:  LayoutNode::Pane(id),
                 panes,
                 focus:   id,
-                mode:    InputMode::Normal,
                 next_id: 1,
             },
             reader,
@@ -819,65 +807,50 @@ fn dispatch_input(
     state: &mut AppState,
     area: Rect,
     key: KeyEvent,
-    tx: &mpsc::Sender<AppEvent>,
+    _tx: &mpsc::Sender<AppEvent>, // Prefix unused with an underscore since we don't need it right now
 ) -> Result<(bool, Option<(PaneId, Box<dyn Read + Send>)>)> {
-    match state.mode {
-        // ── Normal mode ───────────────────────────────────────────────────
-        InputMode::Normal => {
-            if key.code == KeyCode::Char('b')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-            {
-                state.mode = InputMode::PrefixActive;
-                return Ok((false, None));
+    
+    // Check if the ALT modifier is pressed
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            // ── Quit ──────────────────────────────────────────────────
+            KeyCode::Char('q') => return Ok((true, None)),
+
+            // ── Focus movement ────────────────────────────────────────
+            KeyCode::Char('h') => state.move_focus(area, Dir::Left),
+            KeyCode::Char('l') => state.move_focus(area, Dir::Right),
+            KeyCode::Char('k') => state.move_focus(area, Dir::Up),
+            KeyCode::Char('j') => state.move_focus(area, Dir::Down),
+
+            // ── Split vertical (left / right) ─────────────────────────
+            KeyCode::Char('v') => {
+                let (new_id, reader) = state.do_split(area, SplitKind::Vertical)?;
+                return Ok((false, Some((new_id, reader))));
             }
-            if let Some(pane) = state.panes.get_mut(&state.focus) {
-                forward_key(key, &mut pane.writer)?;
+
+            // ── Split horizontal (top / bottom) ───────────────────────
+            KeyCode::Char('s') => {
+                let (new_id, reader) = state.do_split(area, SplitKind::Horizontal)?;
+                return Ok((false, Some((new_id, reader))));
             }
+
+            // ── Close focused pane ────────────────────────────────────
+            KeyCode::Char('x') => {
+                let target = state.focus;
+                let should_quit = state.close_pane(target, area)?;
+                return Ok((should_quit, None));
+            }
+
+            // Ignore other Alt bindings
+            _ => {}
         }
-
-        // ── Prefix-active mode ────────────────────────────────────────────
-        InputMode::PrefixActive => {
-            state.mode = InputMode::Normal; // always revert first
-
-            match key.code {
-                // ── Quit ──────────────────────────────────────────────────
-                KeyCode::Char('q') => return Ok((true, None)),
-
-                // ── Focus movement ────────────────────────────────────────
-                KeyCode::Char('h') => state.move_focus(area, Dir::Left),
-                KeyCode::Char('l') => state.move_focus(area, Dir::Right),
-                KeyCode::Char('k') => state.move_focus(area, Dir::Up),
-                KeyCode::Char('j') => state.move_focus(area, Dir::Down),
-
-                // ── Split vertical (left / right) ─────────────────────────
-                KeyCode::Char('v') => {
-                    let (new_id, reader) = state.do_split(area, SplitKind::Vertical)?;
-                    // Caller will spawn the reader thread.
-                    return Ok((false, Some((new_id, reader))));
-                }
-
-                // ── Split horizontal (top / bottom) ───────────────────────
-                KeyCode::Char('s') => {
-                    let (new_id, reader) = state.do_split(area, SplitKind::Horizontal)?;
-                    return Ok((false, Some((new_id, reader))));
-                }
-
-                // ── Close focused pane ────────────────────────────────────
-                KeyCode::Char('x') => {
-                    let target = state.focus;
-                    let should_quit = state.close_pane(target, area)?;
-                    return Ok((should_quit, None));
-                }
-
-                // ── Cancel ────────────────────────────────────────────────
-                KeyCode::Esc => {}
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
-
-                // ── Unknown prefix command: swallow ───────────────────────
-                _ => {}
-            }
+    } else {
+        // Passthrough: If Alt is not pressed, forward everything to the PTY
+        if let Some(pane) = state.panes.get_mut(&state.focus) {
+            forward_key(key, &mut pane.writer)?;
         }
     }
+
     Ok((false, None))
 }
 
@@ -940,43 +913,18 @@ fn draw(
         );
 
         // ── Bottom status bar ─────────────────────────────────────────────
-        let status = match state.mode {
-            InputMode::Normal => Line::from(vec![
-                Span::styled(" NORMAL ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled(" │ ", Style::default().fg(theme::DIM_BORDER)),
-                Span::styled("^B v", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" vsplit  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("^B s", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" hsplit  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("^B x", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" close  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("^B h/j/k/l", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" focus  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("^B q", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" quit", Style::default().fg(theme::DIM_TEXT)),
-            ]),
-            InputMode::PrefixActive => Line::from(vec![
-                Span::styled(
-                    " PREFIX ",
-                    Style::default()
-                        .fg(theme::PREFIX_FG)
-                        .bg(theme::PREFIX_BG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  v", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" vsplit  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("s", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" hsplit  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("x", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" close  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("h/j/k/l", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" focus  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("q", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" quit  ", Style::default().fg(theme::DIM_TEXT)),
-                Span::styled("Esc", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                Span::styled(" cancel", Style::default().fg(theme::DIM_TEXT)),
-            ]),
-        };
+        let status = Line::from(vec![
+            Span::styled(" Alt+V ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("vsplit │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+S ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("hsplit │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+X ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("close │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+H/J/K/L ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("focus │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+Q ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("quit", Style::default().fg(theme::DIM_TEXT)),
+        ]);
         frame.render_widget(Paragraph::new(status), bot_area);
 
         // ── Tiled panes ───────────────────────────────────────────────────
