@@ -1,4 +1,4 @@
-//! TDE — Tiling Desktop Environment, Phase 3: Dynamic Pane Management
+//! TDE — Terminal Desktop Environment, Phase 3: Dynamic Pane Management
 //!
 //! ## What's new in Phase 3
 //!
@@ -73,8 +73,26 @@ use std::{
     mem,
     sync::{Arc, Mutex},
     time::Duration,
-    path::{Path, PathBuf},
+    path::PathBuf,
+    fs::OpenOptions,
 };
+
+// ── Debug logger ─────────────────────────────────────────────────────────────
+// Writes to /tmp/tde_debug.log. We cannot use stdout (ratatui owns it) or
+// eprintln! (goes to the alternate screen). Open the file once per call to
+// avoid needing a global mutex — performance doesn't matter for debug logging.
+fn dlog(msg: &str) {
+    use std::io::Write as _;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true).append(true).open("/tmp/tde_debug.log")
+    {
+        let _ = writeln!(f, "[{ts}] {msg}");
+    }
+}
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -153,13 +171,14 @@ struct TerminalPane {
 }
 
 impl TerminalPane {
-    fn new(id: PaneId, rows: u16, cols: u16) -> Result<(Self, Box<dyn Read + Send>)> {
+    fn new(id: PaneId, rows: u16, cols: u16, custom_cmd: Option<CommandBuilder>) -> Result<(Self, Box<dyn Read + Send>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("openpty")?;
 
-        let child  = pair.slave.spawn_command(shell_cmd()).context("spawn shell")?;
+        let cmd = custom_cmd.unwrap_or_else(shell_cmd);
+        let child  = pair.slave.spawn_command(cmd).context("spawn shell")?;
         let reader = pair.master.try_clone_reader().context("clone PTY reader")?;
         let writer = pair.master.take_writer().context("take PTY writer")?;
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
@@ -174,6 +193,25 @@ impl TerminalPane {
         let mut g = self.parser.lock().expect("parser poisoned");
         *g = vt100::Parser::new(rows, cols, 0);
         Ok(())
+    }
+}
+
+impl Drop for TerminalPane {
+    fn drop(&mut self) {
+        dlog(&format!("TerminalPane::drop pane_id={}", self.id));
+        // Attempt a clean exit first. We inject an Escape key followed by the 
+        // standard Vim force-quit command. This allows the child process to 
+        // close its own file descriptors cleanly, avoiding OS-level PTY panics.
+        let _ = self.writer.write_all(b"\x1b:qa!\r");
+        let _ = self.writer.flush();
+        
+        // Give the process a brief window to exit gracefully
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        
+        // Force kill as a fallback if it was unresponsive
+        dlog(&format!("TerminalPane::drop killing pane_id={}", self.id));
+        let _ = self._child.kill();
+        dlog(&format!("TerminalPane::drop done pane_id={}", self.id));
     }
 }
 
@@ -499,7 +537,7 @@ impl AppState {
         let rows = area.height.saturating_sub(2).max(2);
         let cols = area.width.saturating_sub(2).max(8);
 
-        let (pane, reader) = TerminalPane::new(id, rows, cols)?;
+        let (pane, reader) = TerminalPane::new(id, rows, cols, None)?;
         let mut panes = HashMap::new();
         panes.insert(id, AppPane::Terminal(pane));
 
@@ -566,16 +604,14 @@ impl AppState {
         &mut self,
         area: Rect,
         kind: SplitKind,
+        cmd: Option<CommandBuilder>,
     ) -> Result<(PaneId, Box<dyn Read + Send>)> {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        // Compute the dimensions the new pane will have after the split.
-        // We walk the layout to find the focused pane's current rect, then
-        // halve it along the split axis.
         let (rows, cols) = self.new_pane_size(area, kind);
 
-        let (pane, reader) = TerminalPane::new(new_id, rows, cols)?;
+        let (pane, reader) = TerminalPane::new(new_id, rows, cols, cmd)?;
         self.panes.insert(new_id, AppPane::Terminal(pane));
 
         // Mutate the tree: replace Pane(focus) with Split{Pane(focus), Pane(new)}.
@@ -668,6 +704,9 @@ impl AppState {
         // ── Choose the pane that will receive focus after removal ─────────
         // We pick from surviving panes using document order; prefer the pane
         // immediately before the target, falling back to the one after.
+        // Among all candidates, prefer a Terminal pane over an Explorer pane
+        // so that closing a pane never silently strands focus on the explorer
+        // (which swallows all regular keypresses).
         let survivors: Vec<PaneId> = self.layout
             .all_pane_ids()
             .into_iter()
@@ -678,12 +717,23 @@ impl AppState {
         // or the first overall.
         let all_ids = self.layout.all_pane_ids();
         let target_pos = all_ids.iter().position(|id| *id == target).unwrap_or(0);
-        let new_focus = if target_pos > 0 {
+        let positional_focus = if target_pos > 0 {
             all_ids[target_pos - 1]
         } else {
-            // target was first; shift to what will be first after removal.
             survivors[0]
         };
+
+        // Upgrade: if the positional candidate is an Explorer, try to find
+        // any Terminal pane among survivors instead.
+        let new_focus = if matches!(self.panes.get(&positional_focus), Some(AppPane::Explorer(_))) {
+            survivors.iter()
+                .find(|id| matches!(self.panes.get(id), Some(AppPane::Terminal(_))))
+                .copied()
+                .unwrap_or(positional_focus) // all survivors are explorers — accept it
+        } else {
+            positional_focus
+        };
+        dlog(&format!("close_pane: target={target} positional_focus={positional_focus} new_focus={new_focus}"));
 
         // ── Prune the layout tree ──────────────────────────────────────────
         self.layout.prune_pane(target);
@@ -779,19 +829,31 @@ fn spawn_pane_reader(
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
-                    let _ = tx.blocking_send(AppEvent::PtyExited { pane_id });
+                    // Keep retrying the send for PtyExited — it is a small,
+                    // infrequent message and we must not silently drop it.
+                    // If the channel is full, spin-wait briefly rather than
+                    // blocking indefinitely with blocking_send on a saturated
+                    // channel (which would hold the tx clone alive forever).
+                    loop {
+                        match tx.try_send(AppEvent::PtyExited { pane_id }) {
+                            Ok(_) => break,
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
                     break;
                 }
                 Ok(n) => {
-                    if tx
-                        .blocking_send(AppEvent::PtyOutput {
-                            pane_id,
-                            bytes: buf[..n].to_vec(),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+                    // PTY output: prefer non-blocking. If the channel is full,
+                    // drop this frame — the terminal will simply not update for
+                    // one read cycle, which is far better than stalling the
+                    // reader thread and blocking the PTY pipe.
+                    let _ = tx.try_send(AppEvent::PtyOutput {
+                        pane_id,
+                        bytes: buf[..n].to_vec(),
+                    });
                 }
             }
         }
@@ -825,12 +887,37 @@ fn spawn_dir_read(pane_id: PaneId, path: PathBuf, tx: mpsc::Sender<AppEvent>) {
 }
 
 async fn input_task(tx: mpsc::Sender<AppEvent>) {
-    let mut stream = EventStream::new();
+    let mut iteration = 0u32;
     loop {
-        match stream.next().await {
-            Some(Ok(ev)) => { if tx.send(AppEvent::Input(ev)).await.is_err() { break; } }
-            Some(Err(_)) | None => break,
+        iteration += 1;
+        dlog(&format!("input_task: creating EventStream (iteration {iteration})"));
+        let mut stream = EventStream::new();
+        loop {
+            match stream.next().await {
+                Some(Ok(ev)) => {
+                    if tx.send(AppEvent::Input(ev)).await.is_err() {
+                        // Receiver dropped — event loop has exited; stop entirely.
+                        dlog("input_task: channel closed, exiting");
+                        return;
+                    }
+                }
+                Some(Err(e)) => {
+                    dlog(&format!("input_task: EventStream error: {e} — recreating stream"));
+                    break;
+                }
+                None => {
+                    dlog("input_task: EventStream returned None — recreating stream");
+                    break;
+                }
+            }
         }
+        // Brief pause before recreating the stream to avoid a tight spin loop
+        // in the unlikely event of a persistent error condition.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Force crossterm to re-sync its internal state with the OS terminal.
+        // This rescues the stream if a SIGCHLD from a killed process interrupted it.
+        let raw_result = crossterm::terminal::enable_raw_mode();
+        dlog(&format!("input_task: enable_raw_mode after stream error: {raw_result:?}"));
     }
 }
 
@@ -899,6 +986,14 @@ fn dispatch_input(
     tx: &mpsc::Sender<AppEvent>, // Prefix unused with an underscore since we don't need it right now
 ) -> Result<(bool, Option<(PaneId, Box<dyn Read + Send>)>)> {
     
+    dlog(&format!(
+        "dispatch_input: key={:?} modifiers={:?} focus={} panes={:?}",
+        key.code,
+        key.modifiers,
+        state.focus,
+        state.panes.keys().collect::<Vec<_>>()
+    ));
+
     // Check if the ALT modifier is pressed
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
@@ -913,13 +1008,13 @@ fn dispatch_input(
 
             // ── Split vertical (left / right) ─────────────────────────
             KeyCode::Char('v') => {
-                let (new_id, reader) = state.do_split(area, SplitKind::Vertical)?;
+                let (new_id, reader) = state.do_split(area, SplitKind::Vertical, None)?;
                 return Ok((false, Some((new_id, reader))));
             }
 
             // ── Split horizontal (top / bottom) ───────────────────────
             KeyCode::Char('s') => {
-                let (new_id, reader) = state.do_split(area, SplitKind::Horizontal)?;
+                let (new_id, reader) = state.do_split(area, SplitKind::Horizontal, None)?;
                 return Ok((false, Some((new_id, reader))));
             }
 
@@ -940,11 +1035,17 @@ fn dispatch_input(
             _ => {}
         }
     } else {
-        // Passthrough: If Alt is not pressed, handle based on pane type
+        // We defer actions that mutate the layout to avoid borrow checker conflicts
+        // since we are currently holding a mut borrow on state.panes.
+        let mut deferred_action = None;
+
         if let Some(pane) = state.panes.get_mut(&state.focus) {
             match pane {
                 AppPane::Terminal(term) => {
-                    forward_key(key, &mut term.writer)?;
+                    dlog(&format!("dispatch_input: forwarding key to pane {}", term.id));
+                    let result = forward_key(key, &mut term.writer);
+                    dlog(&format!("dispatch_input: forward_key result: {result:?}"));
+                    result?;
                 }
                 AppPane::Explorer(exp) => {
                     match key.code {
@@ -956,24 +1057,64 @@ fn dispatch_input(
                             let i = exp.list_state.selected().unwrap_or(0);
                             if i > 0 { exp.list_state.select(Some(i - 1)); }
                         }
-                        KeyCode::Enter => {
+                        KeyCode::Char('D') => { // Shift+D to delete
                             if let Some(i) = exp.list_state.selected() {
                                 if let Some(entry) = exp.entries.get(i) {
-                                    if entry.is_dir {
-                                        let mut new_path = exp.cwd.clone();
-                                        if entry.name == ".." {
-                                            new_path.pop();
-                                        } else {
-                                            new_path.push(&entry.name);
-                                        }
-                                        // Request new dir data
-                                        spawn_dir_read(exp.id, new_path, tx.clone());
+                                    if entry.name != ".." {
+                                        let mut path = exp.cwd.clone();
+                                        path.push(&entry.name);
+                                        deferred_action = Some(("delete", path));
                                     }
                                 }
                             }
                         }
-                        _ => {}
-                    }
+                        KeyCode::Enter => {
+                            if let Some(i) = exp.list_state.selected() {
+                                if let Some(entry) = exp.entries.get(i) {
+                                    let mut path = exp.cwd.clone();
+                                    if entry.name == ".." {
+                                        path.pop();
+                                        spawn_dir_read(exp.id, path, tx.clone());
+                                    } else {
+                                        path.push(&entry.name);
+                                        if entry.is_dir {
+                                            spawn_dir_read(exp.id, path, tx.clone());
+                                        } else {
+                                            // It's a file, trigger nvim open
+                                            deferred_action = Some(("open", path));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            dlog(&format!("dispatch_input: explorer pane swallowed key {:?} (not a handled binding)", key.code));
+                        }
+                    } // match key.code
+                }     // AppPane::Explorer
+            }         // match pane
+        }             // if let Some(pane)
+
+        if let Some((action, path)) = deferred_action {
+            if action == "open" {
+                let mut cmd = CommandBuilder::new("nvim");
+                cmd.arg(path.to_string_lossy().as_ref());
+                cmd.env("TERM", "xterm-256color");
+                
+                // Split vertically and open nvim
+                let (new_id, reader) = state.do_split(area, SplitKind::Vertical, Some(cmd))?;
+                return Ok((false, Some((new_id, reader))));
+                
+            } else if action == "delete" {
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+                
+                // Refresh the current explorer pane
+                if let Some(AppPane::Explorer(exp)) = state.panes.get(&state.focus) {
+                     spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
                 }
             }
         }
@@ -1163,7 +1304,9 @@ async fn run_event_loop(
             // We treat a shell exit identically to a manual `Ctrl+B x` close.
             // This prevents "dead" panes from accumulating.
             AppEvent::PtyExited { pane_id } => {
+                dlog(&format!("event_loop: PtyExited pane_id={pane_id}"));
                 let should_quit = state.close_pane(pane_id, area)?;
+                dlog(&format!("event_loop: after close_pane should_quit={should_quit} remaining_panes={:?}", state.panes.keys().collect::<Vec<_>>()));
                 if should_quit {
                     break;
                 }
@@ -1215,6 +1358,10 @@ async fn run_event_loop(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Truncate the debug log at startup so each run starts fresh.
+    let _ = std::fs::write("/tmp/tde_debug.log", "");
+    dlog("main: TDE starting");
+
     let (term_cols, term_rows) =
         crossterm::terminal::size().context("query terminal size")?;
 
@@ -1244,10 +1391,6 @@ async fn main() -> Result<()> {
     // Crossterm input task.
     let tx_input = tx.clone();
     tokio::spawn(async move { input_task(tx_input).await });
-
-    // Drop the main-held sender clone so the channel closes automatically when
-    // all PTY reader threads exit.
-    drop(tx.clone()); // keep one live clone for run_event_loop to pass to splits
 
     // tx is passed into the event loop so it can start new reader threads for
     // dynamically created panes.
