@@ -363,4 +363,97 @@ mod tests {
         let r1 = cascade_rect(1, screen);
         assert!(r0.x != r1.x || r0.y != r1.y, "consecutive windows overlap perfectly");
     }
+
+    // ── HARDCORE STRESS TESTS & EDGE CASES ────────────────────────────────────
+
+    #[test]
+    fn prune_zigzag_stress_test() {
+        // Deep unbalanced tree: [0 | [1 / [2 | 3]]]
+        // We delete 2. The split [2 | 3] must perfectly collapse to just Pane 3.
+        // The tree should become: [0 | [1 / 3]]
+        let mut tree = LayoutNode::SplitHorizontal {
+            left: Box::new(LayoutNode::Pane(0)),
+            right: Box::new(LayoutNode::SplitVertical {
+                top: Box::new(LayoutNode::Pane(1)),
+                bottom: Box::new(LayoutNode::SplitHorizontal {
+                    left: Box::new(LayoutNode::Pane(2)),
+                    right: Box::new(LayoutNode::Pane(3)),
+                    ratio: 50,
+                }),
+                ratio: 50,
+            }),
+            ratio: 50,
+        };
+
+        tree.prune_pane(2);
+
+        // Verify the remaining structure
+        let ids = tree.all_pane_ids();
+        assert_eq!(ids, vec![0, 1, 3], "Tree did not retain the correct survivors");
+
+        // Deep structural verify
+        match tree {
+            LayoutNode::SplitHorizontal { right, .. } => {
+                match *right {
+                    LayoutNode::SplitVertical { bottom, .. } => {
+                        assert!(
+                            matches!(*bottom, LayoutNode::Pane(3)), 
+                            "CRITICAL: Failed to cleanly collapse the SplitHorizontal into Pane(3)"
+                        );
+                    }
+                    _ => panic!("Expected SplitVertical on the right"),
+                }
+            }
+            _ => panic!("Expected SplitHorizontal at the root"),
+        }
+    }
+
+    #[test]
+    fn cascade_rect_tiny_terminal_violation() {
+        // ASSUMPTION: The terminal is always a standard size.
+        // What happens if the user resizes their terminal to be extremely tiny, 
+        // or connects via a tiny mobile SSH client?
+        let screen = Rect { x: 0, y: 0, width: 15, height: 5 };
+        let r = cascade_rect(0, screen);
+
+        // `cascade_rect` currently tries to enforce a minimum width of 20 and height of 6.
+        // If it forces these minimums, the window will exceed the screen boundary.
+        // When Ratatui tries to draw outside the screen, or draw borders on a crushed Rect, it PANICS.
+        assert!(
+            r.width <= screen.width,
+            "CRITICAL FLAW: Floating window width ({}) exceeds screen width ({}). Ratatui will panic!",
+            r.width, screen.width
+        );
+        assert!(
+            r.height <= screen.height,
+            "CRITICAL FLAW: Floating window height ({}) exceeds screen height ({}). Ratatui will panic!",
+            r.height, screen.height
+        );
+    }
+
+    #[test]
+    fn tiling_crushed_rect_violation() {
+        use crate::app;
+        let screen = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let (mut state, _) = app::AppState::new(screen).unwrap();
+
+        // Attempt to violently spawn 20 vertical panes on a small screen
+        for _ in 1..20 {
+            let _ = state.do_split(screen, SplitKind::Vertical, None).unwrap();
+        }
+
+        let mut min_width = 80;
+        state.layout.walk_rects(screen, &mut |_id, rect| {
+            if rect.width < min_width {
+                min_width = rect.width;
+            }
+        });
+
+        // The safety limiter should have stepped in and refused splits long before width < 2
+        assert!(
+            min_width >= 2,
+            "CRITICAL FLAW: Tiling engine crushed a pane to width {}. Block::inner() will panic!",
+            min_width
+        );
+    }
 }

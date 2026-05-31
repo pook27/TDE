@@ -228,7 +228,21 @@ impl AppState {
         area: Rect,
         kind: SplitKind,
         cmd:  Option<CommandBuilder>,
-    ) -> Result<(PaneId, Box<dyn Read + Send>)> {
+    ) -> Result<Option<(PaneId, Box<dyn Read + Send>)>> {
+        let focus_id = self.focus;
+        let mut focus_rect = area;
+        self.layout.walk_rects(area, &mut |id, rect| {
+            if id == focus_id { focus_rect = rect; }
+        });
+
+        // ── The Safety Limiter ──
+        // Refuse to split if the focused pane is already too small
+        match kind {
+            SplitKind::Vertical if focus_rect.width < 12 => return Ok(None),
+            SplitKind::Horizontal if focus_rect.height < 6 => return Ok(None),
+            _ => {}
+        }
+
         let new_id = self.next_id;
         self.next_id += 1;
 
@@ -248,7 +262,7 @@ impl AppState {
         // Shift focus to the newly created pane.
         self.focus = new_id;
 
-        Ok((new_id, reader))
+        Ok(Some((new_id, reader)))
     }
 
     /// Split the focused pane and spawn a File Explorer.
@@ -258,6 +272,20 @@ impl AppState {
         kind: SplitKind,
         tx:   mpsc::Sender<AppEvent>,
     ) -> Result<()> {
+
+        let focus_id = self.focus;
+        let mut focus_rect = area;
+        self.layout.walk_rects(area, &mut |id, rect| {
+            if id == focus_id { focus_rect = rect; }
+        });
+
+        // ── The Safety Limiter ──
+        match kind {
+            SplitKind::Vertical if focus_rect.width < 12 => return Ok(()),
+            SplitKind::Horizontal if focus_rect.height < 6 => return Ok(()),
+            _ => {}
+        }
+
         let new_id = self.next_id;
         self.next_id += 1;
 
@@ -406,14 +434,12 @@ impl AppState {
             DesktopMode::Tiling => {
                 let mut hit: Option<PaneId> = None;
                 self.layout.walk_rects(area, &mut |id, rect| {
-                    if x >= rect.x
-                        && x < rect.x + rect.width
-                        && y >= rect.y
-                        && y < rect.y + rect.height
-                    {
+                    // Check if the (x, y) coordinates fall within this pane's rectangle
+                    if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
                         hit = Some(id);
                     }
                 });
+                
                 if let Some(id) = hit {
                     if id != self.focus {
                         dlog(&format!("click_focus/tiling: ({x},{y}) → pane {id}"));
@@ -641,6 +667,8 @@ pub fn draw(
             DesktopMode::Tiling => {
                 let focus_id = state.focus;
                 state.layout.walk_rects(content_area, &mut |id, rect| {
+                    if rect.width < 2 || rect.height < 2 { return; }
+
                     let Some(pane) = state.panes.get(&id) else { return };
                     let focused = id == focus_id;
 

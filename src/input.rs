@@ -125,8 +125,11 @@ pub fn dispatch_input(
 
                             // Smart split: prefers vertical, but flips to horizontal if cramped
                             let kind = state.smart_split_kind(area, SplitKind::Vertical);
-                            let (new_id, reader) = state.do_split(area, kind, Some(cmd))?;
-                            return Ok((false, Some((new_id, reader))));
+                            
+                            // Safely unwrap the split if the limiters allowed it
+                            if let Some((new_id, reader)) = state.do_split(area, kind, Some(cmd))? {
+                                return Ok((false, Some((new_id, reader))));
+                            }
                         }
                     }
                     OverlayAction::CreateFile { cwd } => {
@@ -171,14 +174,16 @@ pub fn dispatch_input(
 
             // ── Split vertical (left / right) ──────────────────────────────
             KeyCode::Char('v') => {
-                let (new_id, reader) = state.do_split(area, SplitKind::Vertical, None)?;
-                return Ok((false, Some((new_id, reader))));
+                if let Some((new_id, reader)) = state.do_split(area, SplitKind::Vertical, None)? {
+                    return Ok((false, Some((new_id, reader))));
+                }
+                return Ok((false, None));
             }
-
-            // ── Split horizontal (top / bottom) ────────────────────────────
             KeyCode::Char('s') => {
-                let (new_id, reader) = state.do_split(area, SplitKind::Horizontal, None)?;
-                return Ok((false, Some((new_id, reader))));
+                if let Some((new_id, reader)) = state.do_split(area, SplitKind::Horizontal, None)? {
+                    return Ok((false, Some((new_id, reader))));
+                }
+                return Ok((false, None));
             }
 
             // ── Close focused pane ─────────────────────────────────────────
@@ -193,7 +198,7 @@ pub fn dispatch_input(
                 // Smart split: prefers vertical, but flips to horizontal if cramped
                 let kind = state.smart_split_kind(area, SplitKind::Vertical);
                 state.do_split_explorer(area, kind, tx.clone())?;
-                return Ok((false, None)); // tx handles async data
+                return Ok((false, None));
             }
 
             // ── Command Bar Overlay ────────────────────────────────────────
@@ -314,9 +319,10 @@ pub fn dispatch_input(
                 cmd.arg(path.as_os_str());
                 cmd.env("TERM", "xterm-256color");
 
-                let (new_id, reader) = state.do_split(area, SplitKind::Vertical, Some(cmd))?;
-                return Ok((false, Some((new_id, reader))));
-
+                if let Some((new_id, reader)) = state.do_split(area, SplitKind::Vertical, Some(cmd))? {
+                    return Ok((false, Some((new_id, reader))));
+                } // <--- THIS is the brace that was missing!
+                
             } else if action == "delete" {
                 if path.is_dir() {
                     let _ = std::fs::remove_dir_all(&path);

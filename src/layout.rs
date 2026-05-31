@@ -66,15 +66,14 @@ pub enum LayoutNode {
 
 /// Result of attempting to remove `target` from a subtree.
 pub enum PruneResult {
-    /// Target was not found in this subtree; the caller need not change anything.
+    /// Target was not found in this subtree.
     NotFound,
-    /// Target was found and removed.  `survivor` is the node that should
-    /// replace the one that was pruned:
-    ///
-    /// - `Some(node)` → replace the pruned node (or its parent split) with this.
-    /// - `None`       → the node that was pruned *was* a `Sentinel` placeholder;
-    ///                  this never happens for real pane ids.
-    Pruned { survivor: Option<Box<LayoutNode>> },
+    /// Target was the leaf itself. The caller (parent split) must absorb the 
+    /// loss by replacing itself with its OTHER child.
+    RemoveMe,
+    /// Target was found and pruned deeper in the tree. The tree has already 
+    /// been mutated in place. The caller doesn't need to do anything.
+    Handled,
 }
 
 impl LayoutNode {
@@ -192,64 +191,36 @@ impl LayoutNode {
     /// 1. Swap `self` → `Sentinel`.
     /// 2. Destructure the old split value (now owned).
     /// 3. Write `*self = *surviving_sibling` (or keep the updated split).
+    // ── Tree mutation: prune ──────────────────────────────────────────────────
+
+    /// Recursively remove `LayoutNode::Pane(target)` from the tree.
     pub fn prune_pane(&mut self, target: PaneId) -> PruneResult {
         match self {
             // ── Leaf: is this the target? ─────────────────────────────────
-            LayoutNode::Pane(id) if *id == target => {
-                // Signal to the caller: replace me with my sibling.
-                // We do NOT modify `self` here; the caller (a split arm below,
-                // or AppState::prune) will overwrite us.
-                PruneResult::Pruned { survivor: None }
-            }
-
+            LayoutNode::Pane(id) if *id == target => PruneResult::RemoveMe,
             LayoutNode::Pane(_) => PruneResult::NotFound,
 
             // ── SplitHorizontal ───────────────────────────────────────────
             LayoutNode::SplitHorizontal { left, right, .. } => {
-                // Try left child first.
                 match left.prune_pane(target) {
-                    PruneResult::Pruned { survivor: None } => {
-                        // Left leaf was the target.  Replace this whole split
-                        // with the right child.
+                    PruneResult::RemoveMe => {
                         let old_split = mem::replace(self, LayoutNode::Sentinel);
-                        let right_child = match old_split {
-                            LayoutNode::SplitHorizontal { right, .. } => right,
-                            _ => unreachable!(),
-                        };
-                        *self = *right_child;
-                        PruneResult::Pruned { survivor: None }
-                        // Returning None tells *our* parent: replace your
-                        // reference to us with us (we've already updated *self).
-                        // The parent's job is already done.
+                        if let LayoutNode::SplitHorizontal { right, .. } = old_split {
+                            *self = *right;
+                        }
+                        PruneResult::Handled
                     }
-
-                    PruneResult::Pruned { survivor: Some(new_left) } => {
-                        // A deeper node was pruned; left sub-tree was replaced.
-                        *left = new_left;
-                        // This split node itself is unchanged in structure.
-                        PruneResult::Pruned { survivor: None }
-                    }
-
+                    PruneResult::Handled => PruneResult::Handled,
                     PruneResult::NotFound => {
-                        // Try right child.
                         match right.prune_pane(target) {
-                            PruneResult::Pruned { survivor: None } => {
-                                // Right leaf was the target.  Replace this split
-                                // with the left child.
+                            PruneResult::RemoveMe => {
                                 let old_split = mem::replace(self, LayoutNode::Sentinel);
-                                let left_child = match old_split {
-                                    LayoutNode::SplitHorizontal { left, .. } => left,
-                                    _ => unreachable!(),
-                                };
-                                *self = *left_child;
-                                PruneResult::Pruned { survivor: None }
+                                if let LayoutNode::SplitHorizontal { left, .. } = old_split {
+                                    *self = *left;
+                                }
+                                PruneResult::Handled
                             }
-
-                            PruneResult::Pruned { survivor: Some(new_right) } => {
-                                *right = new_right;
-                                PruneResult::Pruned { survivor: None }
-                            }
-
+                            PruneResult::Handled => PruneResult::Handled,
                             PruneResult::NotFound => PruneResult::NotFound,
                         }
                     }
@@ -259,38 +230,24 @@ impl LayoutNode {
             // ── SplitVertical (mirror of SplitHorizontal) ─────────────────
             LayoutNode::SplitVertical { top, bottom, .. } => {
                 match top.prune_pane(target) {
-                    PruneResult::Pruned { survivor: None } => {
+                    PruneResult::RemoveMe => {
                         let old_split = mem::replace(self, LayoutNode::Sentinel);
-                        let bottom_child = match old_split {
-                            LayoutNode::SplitVertical { bottom, .. } => bottom,
-                            _ => unreachable!(),
-                        };
-                        *self = *bottom_child;
-                        PruneResult::Pruned { survivor: None }
+                        if let LayoutNode::SplitVertical { bottom, .. } = old_split {
+                            *self = *bottom;
+                        }
+                        PruneResult::Handled
                     }
-
-                    PruneResult::Pruned { survivor: Some(new_top) } => {
-                        *top = new_top;
-                        PruneResult::Pruned { survivor: None }
-                    }
-
+                    PruneResult::Handled => PruneResult::Handled,
                     PruneResult::NotFound => {
                         match bottom.prune_pane(target) {
-                            PruneResult::Pruned { survivor: None } => {
+                            PruneResult::RemoveMe => {
                                 let old_split = mem::replace(self, LayoutNode::Sentinel);
-                                let top_child = match old_split {
-                                    LayoutNode::SplitVertical { top, .. } => top,
-                                    _ => unreachable!(),
-                                };
-                                *self = *top_child;
-                                PruneResult::Pruned { survivor: None }
+                                if let LayoutNode::SplitVertical { top, .. } = old_split {
+                                    *self = *top;
+                                }
+                                PruneResult::Handled
                             }
-
-                            PruneResult::Pruned { survivor: Some(new_bottom) } => {
-                                *bottom = new_bottom;
-                                PruneResult::Pruned { survivor: None }
-                            }
-
+                            PruneResult::Handled => PruneResult::Handled,
                             PruneResult::NotFound => PruneResult::NotFound,
                         }
                     }

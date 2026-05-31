@@ -65,6 +65,8 @@ pub fn draw_gui(frame: &mut Frame, state: &AppState, full_area: Rect) {
     // else, which is the correct compositor ordering.
     for win in &state.floating_windows {
         // Guard: skip stale windows whose pane was removed mid-session.
+        if win.area.width < 2 || win.area.height < 2 { continue; }
+        
         let Some(pane) = state.panes.get(&win.id) else { continue };
 
         let focused = win.id == state.focus;

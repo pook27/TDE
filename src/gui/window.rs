@@ -66,8 +66,8 @@ pub const WIN_HEIGHT_PCT: u16 = 60;
 ///              the full terminal minus the top/bottom chrome bars).
 pub fn cascade_rect(n: u16, screen: Rect) -> Rect {
     // Compute base dimensions (percentage of screen).
-    let win_w = (screen.width  * WIN_WIDTH_PCT  / 100).max(20);
-    let win_h = (screen.height * WIN_HEIGHT_PCT / 100).max(6);
+    let win_w = (screen.width  * WIN_WIDTH_PCT  / 100).max(20).min(screen.width);
+    let win_h = (screen.height * WIN_HEIGHT_PCT / 100).max(6).min(screen.height);
 
     // Centre of the screen.
     let centre_x = screen.x + screen.width  / 2;
