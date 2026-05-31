@@ -111,7 +111,12 @@ fn dlog(msg: &str) {
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind, EnableBracketedPaste, DisableBracketedPaste},
+    event::{
+        Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEventKind,
+        EnableBracketedPaste, DisableBracketedPaste,
+        EnableMouseCapture, DisableMouseCapture,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -839,6 +844,33 @@ impl AppState {
         }
         Ok(())
     }
+
+    // ── Spatial mouse hit-test ────────────────────────────────────────────────
+
+    /// Walk every pane rect and focus the one whose bounding box contains
+    /// `(x, y)`.  Returns `true` when focus actually changed (so the caller
+    /// knows whether a redraw is needed).
+    fn click_focus(&mut self, area: Rect, x: u16, y: u16) -> bool {
+        let mut hit: Option<PaneId> = None;
+        self.layout.walk_rects(area, &mut |id, rect| {
+            // Check containment including the border cells.
+            if x >= rect.x
+                && x < rect.x + rect.width
+                && y >= rect.y
+                && y < rect.y + rect.height
+            {
+                hit = Some(id);
+            }
+        });
+        if let Some(id) = hit {
+            if id != self.focus {
+                dlog(&format!("click_focus: ({x},{y}) → pane {id}"));
+                self.focus = id;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -887,7 +919,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste).context("enter alternate screen")?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+        ).context("enter alternate screen")?;
         Ok(Self)
     }
 }
@@ -895,7 +932,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+        );
     }
 }
 
@@ -1302,8 +1344,6 @@ mod theme {
     pub const TITLE_BADGE_BG:  Color = Color::Cyan;
     pub const KEY_HINT:        Color = Color::Yellow;
     pub const DIM_TEXT:        Color = Color::DarkGray;
-    pub const PREFIX_FG:       Color = Color::Black;
-    pub const PREFIX_BG:       Color = Color::Yellow;
 }
 
 fn draw(
@@ -1566,6 +1606,44 @@ async fn run_event_loop(
                 }
 
                 Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => {}
+
+                // ── Left-click: spatial focus ──────────────────────────────
+                Event::Mouse(m)
+                    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    if state.click_focus(area, m.column, m.row) {
+                        draw(terminal, state)?;
+                    }
+                }
+
+                // ── Scroll wheel: Explorer navigation ─────────────────────
+                Event::Mouse(m)
+                    if matches!(
+                        m.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let focused_id = state.focus;
+                    if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&focused_id) {
+                        let i = exp.list_state.borrow().selected().unwrap_or(0);
+                        match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                if i > 0 {
+                                    exp.list_state.borrow_mut().select(Some(i - 1));
+                                    draw(terminal, state)?;
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if i < exp.entries.len().saturating_sub(1) {
+                                    exp.list_state.borrow_mut().select(Some(i + 1));
+                                    draw(terminal, state)?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 Event::Mouse(_) => {}
                 _ => {}
             },
