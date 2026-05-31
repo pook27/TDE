@@ -1,35 +1,40 @@
-//! TDE — Terminal Desktop Environment, Phase 3: Dynamic Pane Management
-//!
-//! ## What's new in Phase 3
-//!
-//! - Single-pane startup; all layout is built interactively.
-//! - `Ctrl+B v` → vertical split (SplitHorizontal, left/right)
-//! - `Ctrl+B s` → horizontal split (SplitVertical, top/bottom)
-//! - `Ctrl+B x` → close focused pane (tree pruned, focus re-routed)
-//! - Shell exit (`exit`, `Ctrl+D`) → automatic pane close, same pruning path
-//! - Last pane closed → application exits gracefully
+//! TDE — Terminal Desktop Environment, Phase 5: Visual Desktop Compositor
 //!
 //! ## Architecture
 //!
 //! ```text
-//!  AppState { layout: LayoutNode, panes: HashMap<PaneId,TerminalPane>,
-//!             focus: PaneId, mode: InputMode, next_id: PaneId }
+//!  AppState { layout: LayoutNode, panes: HashMap<PaneId,AppPane>,
+//!             focus: PaneId, next_id, overlay,
+//!             mode: DesktopMode, floating_windows: Vec<FloatingWindow> }
 //!
-//!  AppEvent::{PtyOutput{pane_id,bytes}, PtyExited{pane_id}, Input(Event)}
+//!  AppEvent::{PtyOutput{pane_id,bytes}, PtyExited{pane_id},
+//!             Input(Event), ExplorerUpdate{pane_id,path,entries}}
 //!
 //!  run_event_loop()
-//!   ├─ PtyOutput  → parser.process()  → draw()
-//!   ├─ PtyExited  → close_pane()      → draw()  [or quit if last]
-//!   └─ Input      → dispatch_input()  → draw()
+//!   ├─ PtyOutput      → parser.process()   → draw()
+//!   ├─ PtyExited      → close_pane()       → draw()   [or quit if last]
+//!   ├─ ExplorerUpdate → exp.entries = ...  → draw()
+//!   └─ Input          → dispatch_input()   → draw()
+//!        ├─ Alt+G  → toggle_gui_mode()         (Phase 5)
+//!        ├─ Alt+V/S → do_split()
+//!        ├─ Alt+X  → close_pane()
+//!        ├─ Alt+E  → do_split_explorer()
+//!        ├─ Alt+Arrow → move_focus()
+//!        └─ Alt+Q  → quit
+//!
+//!  draw() branches on state.mode:
+//!   ├─ DesktopMode::Tiling → layout.walk_rects() loop  (existing)
+//!   └─ DesktopMode::Gui    → gui::compositor::draw_gui (Phase 5)
 //! ```
 
 // ── Module declarations ───────────────────────────────────────────────────────
 
 pub mod app;
-pub mod layout;
-pub mod vfs;
-pub mod pty;
+pub mod gui;        // ← Phase 5: Visual Desktop Compositor
 pub mod input;
+pub mod layout;
+pub mod pty;
+pub mod vfs;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
@@ -55,16 +60,7 @@ use app::{AppEvent, AppState, input_task, run_event_loop};
 use pty::spawn_pane_reader;
 
 // ── Debug logger ──────────────────────────────────────────────────────────────
-// Writes to /tmp/tde_debug.log. We cannot use stdout (ratatui owns it) or
-// eprintln! (goes to the alternate screen).
-//
-// The file descriptor is opened exactly once and stored in a static OnceLock.
-// Every subsequent call to dlog() acquires the mutex, formats one line, and
-// calls write_all() — no open()/close() syscall pair per message.
-//
-// IMPORTANT: main() must call std::fs::write("/tmp/tde_debug.log", "") to
-// truncate the log *before* the first dlog() call initialises the OnceLock,
-// otherwise the OnceLock's append-mode open would see a stale file.
+
 static DEBUG_LOG: OnceLock<Mutex<File>> = OnceLock::new();
 
 pub fn dlog(msg: &str) {
@@ -122,14 +118,12 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Truncate the debug log at startup so each run starts fresh.
     let _ = std::fs::write("/tmp/tde_debug.log", "");
-    dlog("main: TDE starting");
+    dlog("main: TDE starting (Phase 5 — Visual Desktop Compositor)");
 
     let (term_cols, term_rows) =
         crossterm::terminal::size().context("query terminal size")?;
 
-    // RAII guard — terminal restored on any exit path, including panics.
     let _guard = TerminalGuard::new()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .context("create ratatui terminal")?;
@@ -142,22 +136,16 @@ async fn main() -> Result<()> {
         height: term_rows.saturating_sub(2),
     };
 
-    // Initialise with a single pane.
     let (mut state, initial_reader) =
         AppState::new(content_area).context("init app state")?;
 
-    // Channel capacity: 512 is sufficient for bursty PTY output from many panes.
     let (tx, mut rx) = mpsc::channel::<AppEvent>(512);
 
-    // Start the reader thread for the initial pane.
     spawn_pane_reader(0, initial_reader, tx.clone());
 
-    // Crossterm input task.
     let tx_input = tx.clone();
     tokio::spawn(async move { input_task(tx_input).await });
 
-    // tx is passed into the event loop so it can start new reader threads for
-    // dynamically created panes.
     run_event_loop(&mut terminal, &mut state, content_area, &mut rx, &tx).await?;
 
     Ok(())
@@ -173,9 +161,8 @@ mod tests {
         centroid_x, centroid_y, ranges_overlap_h, ranges_overlap_v,
         LayoutNode, PaneId, SplitKind,
     };
+    use crate::gui::window::cascade_rect;
     use ratatui::layout::Rect;
-
-    // ── Geometry ──────────────────────────────────────────────────────────────
 
     #[test]
     fn centroid_math() {
@@ -189,14 +176,11 @@ mod tests {
         let a = Rect { x:  0, y: 0, width: 40, height: 20 };
         let b = Rect { x: 40, y: 0, width: 40, height: 20 };
         let c = Rect { x:  0, y: 20, width: 80, height: 20 };
-
-        assert!( ranges_overlap_v(a, b), "a/b same rows → v-overlap");
-        assert!(!ranges_overlap_h(a, b), "a/b different cols → no h-overlap");
-        assert!( ranges_overlap_h(a, c), "a/c same cols → h-overlap");
-        assert!(!ranges_overlap_v(a, c), "a/c different rows → no v-overlap");
+        assert!( ranges_overlap_v(a, b));
+        assert!(!ranges_overlap_h(a, b));
+        assert!( ranges_overlap_h(a, c));
+        assert!(!ranges_overlap_v(a, c));
     }
-
-    // ── Layout tree: collect_pane_rects ───────────────────────────────────────
 
     #[test]
     fn collect_rects_single_pane() {
@@ -220,23 +204,16 @@ mod tests {
         let mut rects = Vec::new();
         tree.walk_rects(area, &mut |id, rect| rects.push((id, rect)));
         assert_eq!(rects.len(), 2);
-        // Left pane should be to the left of the right pane.
         assert!(centroid_x(rects[0].1) < centroid_x(rects[1].1));
     }
-
-    // ── Tree mutation: split_pane ─────────────────────────────────────────────
 
     #[test]
     fn split_pane_leaf() {
         let mut tree = LayoutNode::Pane(0);
-        let found = tree.split_pane(0, 1, SplitKind::Vertical);
-        assert!(found, "should find and split pane 0");
-
+        assert!(tree.split_pane(0, 1, SplitKind::Vertical));
         let ids = tree.all_pane_ids();
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&1));
-
+        assert!(ids.contains(&0) && ids.contains(&1));
         assert!(matches!(tree, LayoutNode::SplitHorizontal { .. }));
     }
 
@@ -247,9 +224,7 @@ mod tests {
             right: Box::new(LayoutNode::Pane(1)),
             ratio: 50,
         };
-        let found = tree.split_pane(1, 2, SplitKind::Vertical);
-        assert!(found);
-
+        assert!(tree.split_pane(1, 2, SplitKind::Vertical));
         let ids = tree.all_pane_ids();
         assert_eq!(ids.len(), 3);
         assert!(ids.contains(&0) && ids.contains(&1) && ids.contains(&2));
@@ -258,12 +233,9 @@ mod tests {
     #[test]
     fn split_pane_wrong_target_returns_false() {
         let mut tree = LayoutNode::Pane(0);
-        let found = tree.split_pane(99, 1, SplitKind::Vertical);
-        assert!(!found, "pane 99 doesn't exist");
+        assert!(!tree.split_pane(99, 1, SplitKind::Vertical));
         assert!(matches!(tree, LayoutNode::Pane(0)));
     }
-
-    // ── Tree mutation: prune_pane ─────────────────────────────────────────────
 
     #[test]
     fn prune_right_child_of_split() {
@@ -273,10 +245,8 @@ mod tests {
             ratio: 50,
         };
         tree.prune_pane(1);
-
-        let ids = tree.all_pane_ids();
-        assert_eq!(ids, vec![0], "only pane 0 should survive");
-        assert!(matches!(tree, LayoutNode::Pane(0)), "root should collapse to Pane(0)");
+        assert_eq!(tree.all_pane_ids(), vec![0]);
+        assert!(matches!(tree, LayoutNode::Pane(0)));
     }
 
     #[test]
@@ -287,9 +257,7 @@ mod tests {
             ratio: 50,
         };
         tree.prune_pane(0);
-
-        let ids = tree.all_pane_ids();
-        assert_eq!(ids, vec![1]);
+        assert_eq!(tree.all_pane_ids(), vec![1]);
         assert!(matches!(tree, LayoutNode::Pane(1)));
     }
 
@@ -305,11 +273,9 @@ mod tests {
             ratio: 50,
         };
         tree.prune_pane(2);
-
         let ids = tree.all_pane_ids();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&0) && ids.contains(&1));
-
         match &tree {
             LayoutNode::SplitHorizontal { right, .. } => {
                 assert!(matches!(**right, LayoutNode::Pane(1)));
@@ -326,10 +292,8 @@ mod tests {
             ratio: 50,
         };
         tree.prune_pane(99);
-        assert_eq!(tree.all_pane_ids().len(), 2, "tree unchanged");
+        assert_eq!(tree.all_pane_ids().len(), 2);
     }
-
-    // ── all_pane_ids document order ───────────────────────────────────────────
 
     #[test]
     fn all_pane_ids_order() {
@@ -345,8 +309,6 @@ mod tests {
         assert_eq!(tree.all_pane_ids(), vec![0, 1, 2]);
     }
 
-    // ── Focus selection after close ───────────────────────────────────────────
-
     #[test]
     fn close_pane_focus_selection() {
         let tree = LayoutNode::SplitHorizontal {
@@ -358,11 +320,47 @@ mod tests {
             }),
             ratio: 50,
         };
-        let all = tree.all_pane_ids(); // [0, 1, 2]
+        let all = tree.all_pane_ids();
         let target: PaneId = 2;
         let target_pos = all.iter().position(|id| *id == target).unwrap();
         let survivors: Vec<PaneId> = all.iter().copied().filter(|id| *id != target).collect();
         let new_focus = if target_pos > 0 { all[target_pos - 1] } else { survivors[0] };
         assert_eq!(new_focus, 1);
+    }
+
+    // ── GUI: cascade_rect geometry ────────────────────────────────────────────
+
+    #[test]
+    fn cascade_rect_window_zero_is_centred() {
+        let screen = Rect { x: 0, y: 0, width: 200, height: 50 };
+        let r = cascade_rect(0, screen);
+        assert_eq!(r.width,  120, "60% of 200");
+        assert_eq!(r.height, 30,  "60% of 50");
+        assert!(r.x + r.width  <= screen.x + screen.width,  "overflows right");
+        assert!(r.y + r.height <= screen.y + screen.height, "overflows bottom");
+    }
+
+    #[test]
+    fn cascade_rect_never_overflows() {
+        let screen = Rect { x: 0, y: 1, width: 120, height: 40 };
+        for n in 0..20u16 {
+            let r = cascade_rect(n, screen);
+            assert!(
+                r.x + r.width  <= screen.x + screen.width,
+                "window {n} overflows right: {r:?}"
+            );
+            assert!(
+                r.y + r.height <= screen.y + screen.height,
+                "window {n} overflows bottom: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cascade_rect_successive_windows_differ() {
+        let screen = Rect { x: 0, y: 0, width: 200, height: 60 };
+        let r0 = cascade_rect(0, screen);
+        let r1 = cascade_rect(1, screen);
+        assert!(r0.x != r1.x || r0.y != r1.y, "consecutive windows overlap perfectly");
     }
 }

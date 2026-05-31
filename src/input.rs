@@ -164,10 +164,11 @@ pub fn dispatch_input(
             KeyCode::Char('q') => return Ok((true, None)),
 
             // ── Focus movement ────────────────────────────────────────────
-            KeyCode::Left => state.move_focus(area, Dir::Left),
+            KeyCode::Left  => state.move_focus(area, Dir::Left),
             KeyCode::Right => state.move_focus(area, Dir::Right),
-            KeyCode::Up => state.move_focus(area, Dir::Up),
-            KeyCode::Down => state.move_focus(area, Dir::Down),
+            KeyCode::Up    => state.move_focus(area, Dir::Up),
+            KeyCode::Down  => state.move_focus(area, Dir::Down),
+
             // ── Split vertical (left / right) ──────────────────────────────
             KeyCode::Char('v') => {
                 let (new_id, reader) = state.do_split(area, SplitKind::Vertical, None)?;
@@ -201,6 +202,30 @@ pub fn dispatch_input(
                     action: OverlayAction::SpawnCommand,
                     input: String::new(),
                 });
+                return Ok((false, None));
+            }
+
+            // ── GUI / Tiling mode toggle ───────────────────────────────────
+            //
+            // `toggle_gui_mode` handles both directions of the toggle and
+            // populates `state.floating_windows` with a cascaded layout on
+            // the first switch to `DesktopMode::Gui`.
+            //
+            // `area` here is the content rect (`full_screen` minus the two
+            // chrome bars) that was computed in `run_event_loop` and passed
+            // down through `dispatch_input`.  It is the correct reference
+            // frame for `cascade_rect`.
+            KeyCode::Char('g') => {
+                dlog(&format!(
+                    "dispatch_input: Alt+G → toggle_gui_mode (current: {:?})",
+                    state.mode
+                ));
+                state.toggle_gui_mode(area);
+                dlog(&format!(
+                    "dispatch_input: mode is now {:?}, {} floating windows",
+                    state.mode,
+                    state.floating_windows.len(),
+                ));
                 return Ok((false, None));
             }
 

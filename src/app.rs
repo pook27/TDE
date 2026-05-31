@@ -4,10 +4,12 @@
 //!   - `AppEvent`          — the inter-task message type
 //!   - `AppPane`           — discriminated union over terminal / explorer panes
 //!   - `OverlayAction` / `AppOverlay` — transient command-input overlay
-//!   - `AppState`          — the entire mutable world: layout tree, pane map, focus
+//!   - `DesktopMode`       — Tiling (classic) vs Gui (floating compositor)
+//!   - `AppState`          — the entire mutable world: layout tree, pane map,
+//!                           focus, desktop mode, floating window list
 //!   - `run_event_loop`    — the async select! loop that drives everything
 //!   - `input_task`        — the crossterm `EventStream` producer task
-//!   - `draw`              — ratatui rendering pass
+//!   - `draw`              — ratatui rendering pass (branches on `DesktopMode`)
 //!   - `mod theme`         — palette constants
 
 use std::{
@@ -25,6 +27,7 @@ use crate::layout::{
 use crate::vfs::{ExplorerEntry, ExplorerPane, spawn_dir_read};
 use crate::pty::{TerminalPane, spawn_pane_reader};
 use crate::input::dispatch_input;
+use crate::gui::{compositor::draw_gui, window::{FloatingWindow, cascade_rect}};
 use crate::dlog;
 
 use anyhow::Result;
@@ -54,6 +57,25 @@ pub enum AppEvent {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// § 3  Desktop mode
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Controls which rendering pass `draw()` uses.
+///
+/// `Alt+G` toggles between the two modes at runtime.  The underlying pane
+/// data (`AppState::panes`, `AppState::layout`) is shared between modes, so
+/// switching is instantaneous — no re-spawning or state transfer needed.
+///
+/// `PartialEq` is derived so that `draw()` can branch with `==`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DesktopMode {
+    /// Classic tiling layout driven by `LayoutNode::walk_rects`.
+    Tiling,
+    /// Floating compositor driven by `gui::compositor::draw_gui`.
+    Gui,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // § 6.5  Generic pane discriminant
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -80,11 +102,20 @@ pub struct AppOverlay {
 }
 
 pub struct AppState {
-    pub layout:  LayoutNode,
-    pub panes:   HashMap<PaneId, AppPane>,
-    pub focus:   PaneId,
-    pub next_id: PaneId,
-    pub overlay: Option<AppOverlay>,
+    pub layout:           LayoutNode,
+    pub panes:            HashMap<PaneId, AppPane>,
+    pub focus:            PaneId,
+    pub next_id:          PaneId,
+    pub overlay:          Option<AppOverlay>,
+    // ── Phase 5 additions ──────────────────────────────────────────────────
+    /// Current rendering mode: tiling grid or floating compositor.
+    pub mode:             DesktopMode,
+    /// The ordered floating-window stack (back → front / bottom → top).
+    ///
+    /// Populated on first `Alt+G` switch to `DesktopMode::Gui` if empty.
+    /// Kept in sync with `AppState::panes`: entries are removed in
+    /// `close_pane` when their backing pane is destroyed.
+    pub floating_windows: Vec<FloatingWindow>,
 }
 
 impl AppState {
@@ -100,11 +131,13 @@ impl AppState {
 
         Ok((
             Self {
-                layout:  LayoutNode::Pane(id),
+                layout:           LayoutNode::Pane(id),
                 panes,
-                focus:   id,
-                next_id: 1,
-                overlay: None,
+                focus:            id,
+                next_id:          1,
+                overlay:          None,
+                mode:             DesktopMode::Tiling,
+                floating_windows: Vec::new(),
             },
             reader,
         ))
@@ -157,7 +190,8 @@ impl AppState {
 
     // ── Smart split heuristic ────────────────────────────────────────────────
 
-    /// Determines the best split direction based on the focused pane's current dimensions.
+    /// Determines the best split direction based on the focused pane's current
+    /// dimensions.
     pub fn smart_split_kind(&self, area: Rect, preferred: SplitKind) -> SplitKind {
         let focus_id = self.focus;
         let mut focus_rect = area;
@@ -276,6 +310,9 @@ impl AppState {
     /// Remove `target` from both the layout tree and the pane HashMap.
     /// Drops `TerminalPane`, which drops `_child` → shell receives SIGHUP.
     ///
+    /// Also removes any `FloatingWindow` whose id matches `target` so the
+    /// GUI compositor never renders a window with a dangling pane reference.
+    ///
     /// Returns `true` if the *last* pane was just closed (caller should quit).
     pub fn close_pane(&mut self, target: PaneId, area: Rect) -> Result<bool> {
         // Guard: ignore stale PtyExited events for already-removed panes.
@@ -286,6 +323,7 @@ impl AppState {
         // ── Special case: only one pane left ──────────────────────────────
         if self.panes.len() == 1 {
             self.panes.remove(&target);
+            self.floating_windows.retain(|w| w.id != target);
             return Ok(true);
         }
 
@@ -321,6 +359,12 @@ impl AppState {
         // ── Remove from HashMap (drops TerminalPane → drops child) ────────
         self.panes.remove(&target);
 
+        // ── Remove any floating window for the closed pane ────────────────
+        //
+        // This keeps `floating_windows` in sync with `panes` so the GUI
+        // compositor never iterates a window that has no backing pane.
+        self.floating_windows.retain(|w| w.id != target);
+
         // ── Update focus ──────────────────────────────────────────────────
         self.focus = new_focus;
 
@@ -352,27 +396,96 @@ impl AppState {
     // ── Spatial mouse hit-test ────────────────────────────────────────────────
 
     /// Walk every pane rect and focus the one whose bounding box contains
-    /// `(x, y)`.  Returns `true` when focus actually changed (so the caller
-    /// knows whether a redraw is needed).
+    /// `(x, y)`.  In `DesktopMode::Gui` the floating window list is
+    /// hit-tested top-to-bottom (last entry first) instead.
+    ///
+    /// Returns `true` when focus actually changed (so the caller knows whether
+    /// a redraw is needed).
     pub fn click_focus(&mut self, area: Rect, x: u16, y: u16) -> bool {
-        let mut hit: Option<PaneId> = None;
-        self.layout.walk_rects(area, &mut |id, rect| {
-            if x >= rect.x
-                && x < rect.x + rect.width
-                && y >= rect.y
-                && y < rect.y + rect.height
-            {
-                hit = Some(id);
+        match self.mode {
+            DesktopMode::Tiling => {
+                let mut hit: Option<PaneId> = None;
+                self.layout.walk_rects(area, &mut |id, rect| {
+                    if x >= rect.x
+                        && x < rect.x + rect.width
+                        && y >= rect.y
+                        && y < rect.y + rect.height
+                    {
+                        hit = Some(id);
+                    }
+                });
+                if let Some(id) = hit {
+                    if id != self.focus {
+                        dlog(&format!("click_focus/tiling: ({x},{y}) → pane {id}"));
+                        self.focus = id;
+                        return true;
+                    }
+                }
+                false
             }
-        });
-        if let Some(id) = hit {
-            if id != self.focus {
-                dlog(&format!("click_focus: ({x},{y}) → pane {id}"));
-                self.focus = id;
-                return true;
+
+            DesktopMode::Gui => {
+                // Hit-test the window stack top-to-bottom (reverse iteration).
+                // The topmost window that contains the click wins.
+                let hit = self.floating_windows.iter().rev().find(|w| {
+                    x >= w.area.x
+                        && x < w.area.x + w.area.width
+                        && y >= w.area.y
+                        && y < w.area.y + w.area.height
+                });
+                if let Some(win) = hit {
+                    let id = win.id;
+                    if id != self.focus {
+                        dlog(&format!("click_focus/gui: ({x},{y}) → pane {id}"));
+                        self.focus = id;
+                        return true;
+                    }
+                }
+                false
             }
         }
-        false
+    }
+
+    // ── GUI mode toggle ───────────────────────────────────────────────────────
+
+    /// Toggle between `DesktopMode::Tiling` and `DesktopMode::Gui`.
+    ///
+    /// ## Cascade population
+    ///
+    /// When switching **to** `DesktopMode::Gui`, if `floating_windows` is
+    /// empty we populate it with one `FloatingWindow` per existing pane using
+    /// the `cascade_rect` geometry helper.  The pane ids come from
+    /// `layout.all_pane_ids()` so their order matches the left-to-right,
+    /// top-to-bottom document order of the tiling tree.
+    ///
+    /// We do **not** repopulate if `floating_windows` is already non-empty —
+    /// that preserves any window positions the user may have arranged.
+    ///
+    /// `content_area` is the content rect (full screen minus chrome bars) and
+    /// is forwarded to `cascade_rect` for geometry computation.
+    pub fn toggle_gui_mode(&mut self, content_area: Rect) {
+        match self.mode {
+            DesktopMode::Tiling => {
+                self.mode = DesktopMode::Gui;
+
+                // Populate the window stack if it has never been built.
+                if self.floating_windows.is_empty() {
+                    let ids = self.layout.all_pane_ids();
+                    for (n, id) in ids.into_iter().enumerate() {
+                        let rect = cascade_rect(n as u16, content_area);
+                        self.floating_windows.push(FloatingWindow::new(id, rect));
+                        dlog(&format!(
+                            "toggle_gui: cascade window {n} → pane {id} at {:?}",
+                            rect
+                        ));
+                    }
+                }
+            }
+
+            DesktopMode::Gui => {
+                self.mode = DesktopMode::Tiling;
+            }
+        }
     }
 }
 
@@ -409,7 +522,6 @@ pub async fn input_task(tx: mpsc::Sender<AppEvent>) {
         // in the unlikely event of a persistent error condition.
         tokio::time::sleep(Duration::from_millis(50)).await;
         // Force crossterm to re-sync its internal state with the OS terminal.
-        // This rescues the stream if a SIGCHLD from a killed process interrupted it.
         let raw_result = crossterm::terminal::enable_raw_mode();
         dlog(&format!("input_task: enable_raw_mode after stream error: {raw_result:?}"));
     }
@@ -449,6 +561,14 @@ pub fn draw(
         let (top_area, content_area, bot_area) = (outer[0], outer[1], outer[2]);
 
         // ── Top bar ───────────────────────────────────────────────────────
+        let mode_label = match state.mode {
+            DesktopMode::Tiling => " TILING ",
+            DesktopMode::Gui    => " GUI ",
+        };
+        let mode_style = match state.mode {
+            DesktopMode::Tiling => Style::default().fg(theme::TITLE_BADGE_FG).bg(theme::TITLE_BADGE_BG),
+            DesktopMode::Gui    => Style::default().fg(Color::Black).bg(Color::Magenta),
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -459,8 +579,12 @@ pub fn draw(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "  Terminal Desktop Environment",
+                    "  Terminal Desktop Environment  ",
                     Style::default().fg(theme::ACCENT),
+                ),
+                Span::styled(
+                    mode_label,
+                    mode_style.add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  [{} pane(s)]", state.panes.len()),
@@ -476,10 +600,10 @@ pub fn draw(
             Some(AppPane::Explorer(_))
         );
 
-        let mut hints = Vec::new();
+        let mut hints: Vec<Span> = Vec::new();
 
         if is_explorer {
-            hints.extend(vec![
+            hints.extend([
                 Span::styled(" c ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
                 Span::styled("create │", Style::default().fg(theme::DIM_TEXT)),
                 Span::styled(" D ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
@@ -489,7 +613,7 @@ pub fn draw(
             ]);
         }
 
-        hints.extend(vec![
+        hints.extend([
             Span::styled(" Alt+Space ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("cmd │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+E ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
@@ -498,79 +622,94 @@ pub fn draw(
             Span::styled("split │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+X ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("close │", Style::default().fg(theme::DIM_TEXT)),
-            Span::styled(" Alt+Arrow Keys ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled(" Alt+Arrows ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("focus │", Style::default().fg(theme::DIM_TEXT)),
+            Span::styled(" Alt+G ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled("gui │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+Q ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("quit", Style::default().fg(theme::DIM_TEXT)),
         ]);
 
         frame.render_widget(Paragraph::new(Line::from(hints)), bot_area);
 
-        // ── Tiled panes ───────────────────────────────────────────────────
-        let focus_id = state.focus;
-        state.layout.walk_rects(content_area, &mut |id, rect| {
-            let Some(pane) = state.panes.get(&id) else { return };
-            let focused = id == focus_id;
+        // ── Content area: branch on desktop mode ──────────────────────────
+        //
+        // Both branches receive `content_area` — the rect between the two
+        // chrome bars.  Neither branch touches `top_area` or `bot_area`.
+        match state.mode {
+            // ── Tiling: existing zero-allocation walk_rects loop ──────────
+            DesktopMode::Tiling => {
+                let focus_id = state.focus;
+                state.layout.walk_rects(content_area, &mut |id, rect| {
+                    let Some(pane) = state.panes.get(&id) else { return };
+                    let focused = id == focus_id;
 
-            let border_style = if focused {
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::DIM_BORDER)
-            };
+                    let border_style = if focused {
+                        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::DIM_BORDER)
+                    };
 
-            let title_str = if focused {
-                format!(" [{}] ● ", id)
-            } else {
-                format!(" [{}] ", id)
-            };
+                    let title_str = if focused {
+                        format!(" [{}] ● ", id)
+                    } else {
+                        format!(" [{}] ", id)
+                    };
 
-            let title_style = if focused {
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::DIM_TEXT)
-            };
+                    let title_style = if focused {
+                        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::DIM_TEXT)
+                    };
 
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(Span::styled(title_str, title_style));
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border_style)
+                        .title(Span::styled(title_str, title_style));
 
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
+                    let inner = block.inner(rect);
+                    frame.render_widget(block, rect);
 
-            match pane {
-                AppPane::Terminal(term) => {
-                    let guard = term.parser.lock().expect("parser poisoned");
-                    frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
-                }
-                AppPane::Explorer(exp) => {
-                    let items: Vec<ListItem> = exp.entries.iter().map(|e| {
-                        let icon  = if e.is_dir { "📁" } else { "📄" };
-                        let style = if e.is_dir {
-                            Style::default().fg(Color::Blue)
-                        } else {
-                            Style::default()
-                        };
-                        ListItem::new(format!(" {} {}", icon, e.name)).style(style)
-                    }).collect();
+                    match pane {
+                        AppPane::Terminal(term) => {
+                            let guard = term.parser.lock().expect("parser poisoned");
+                            frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
+                        }
+                        AppPane::Explorer(exp) => {
+                            let items: Vec<ListItem> = exp.entries.iter().map(|e| {
+                                let icon  = if e.is_dir { "📁" } else { "📄" };
+                                let style = if e.is_dir {
+                                    Style::default().fg(Color::Blue)
+                                } else {
+                                    Style::default()
+                                };
+                                ListItem::new(format!(" {} {}", icon, e.name)).style(style)
+                            }).collect();
 
-                    let list = List::new(items)
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol(">> ");
+                            let list = List::new(items)
+                                .highlight_style(
+                                    Style::default()
+                                        .bg(Color::DarkGray)
+                                        .add_modifier(Modifier::BOLD),
+                                )
+                                .highlight_symbol(">> ");
 
-                    frame.render_stateful_widget(
-                        list, inner,
-                        &mut *exp.list_state.borrow_mut(),
-                    );
-                }
+                            frame.render_stateful_widget(
+                                list, inner,
+                                &mut *exp.list_state.borrow_mut(),
+                            );
+                        }
+                    }
+                });
             }
-        });
 
-        // ── Draw Overlay (Always on top) ──────────────────────────────────
+            // ── GUI: floating compositor ──────────────────────────────────
+            DesktopMode::Gui => {
+                draw_gui(frame, state, content_area);
+            }
+        }
+
+        // ── Draw Overlay (Always on top, both modes) ──────────────────────
         if let Some(overlay) = &state.overlay {
             let mut overlay_area = centered_rect(40, 20, full);
             overlay_area.height = 3;
@@ -578,8 +717,8 @@ pub fn draw(
             frame.render_widget(Clear, overlay_area);
 
             let title = match overlay.action {
-                OverlayAction::SpawnCommand        => " Run Command (Alt+Space) ",
-                OverlayAction::CreateFile { .. }   => " Create File/Dir (ends with / for dir) ",
+                OverlayAction::SpawnCommand      => " Run Command (Alt+Space) ",
+                OverlayAction::CreateFile { .. } => " Create File/Dir (ends with / for dir) ",
             };
 
             let block = Block::default()

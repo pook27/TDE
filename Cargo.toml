@@ -1,6 +1,6 @@
 [package]
-name = "tde"
-version = "0.2.0"
+name = "TDE"
+version = "0.3.0"
 edition = "2024"
 description = "TDE - Terminal Desktop Environment"
 
