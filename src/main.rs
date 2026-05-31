@@ -68,35 +68,50 @@
 //! ```
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
+    fs::{File, OpenOptions},
     io::{self, Read, Write},
     mem,
-    sync::{Arc, Mutex},
-    time::Duration,
     path::PathBuf,
-    fs::OpenOptions,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 // ── Debug logger ─────────────────────────────────────────────────────────────
 // Writes to /tmp/tde_debug.log. We cannot use stdout (ratatui owns it) or
-// eprintln! (goes to the alternate screen). Open the file once per call to
-// avoid needing a global mutex — performance doesn't matter for debug logging.
+// eprintln! (goes to the alternate screen).
+//
+// The file descriptor is opened exactly once and stored in a static OnceLock.
+// Every subsequent call to dlog() acquires the mutex, formats one line, and
+// calls write_all() — no open()/close() syscall pair per message.
+//
+// IMPORTANT: main() must call std::fs::write("/tmp/tde_debug.log", "") to
+// truncate the log *before* the first dlog() call initialises the OnceLock,
+// otherwise the OnceLock's append-mode open would see a stale file.
+static DEBUG_LOG: OnceLock<Mutex<File>> = OnceLock::new();
+
 fn dlog(msg: &str) {
-    use std::io::Write as _;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true).append(true).open("/tmp/tde_debug.log")
-    {
-        let _ = writeln!(f, "[{ts}] {msg}");
+    let file_mutex = DEBUG_LOG.get_or_init(|| {
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/tde_debug.log")
+            .expect("cannot open debug log");
+        Mutex::new(f)
+    });
+    if let Ok(mut guard) = file_mutex.lock() {
+        let _ = writeln!(*guard, "[{ts}] {msg}");
     }
 }
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind, EnableBracketedPaste, DisableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -229,18 +244,22 @@ struct ExplorerPane {
     id: PaneId,
     cwd: PathBuf,
     entries: Vec<ExplorerEntry>,
-    list_state: ListState,
+    /// `RefCell` lets `draw()` (which takes `&AppState`) call
+    /// `render_stateful_widget` without cloning the selection state.
+    /// Interior mutability is safe here: draw() is always called from the
+    /// single-threaded event loop, never concurrently with input handlers.
+    list_state: RefCell<ListState>,
 }
 
 impl ExplorerPane {
     fn new(id: PaneId, path: PathBuf) -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
+        let mut ls = ListState::default();
+        ls.select(Some(0));
         Self {
             id,
             cwd: path,
             entries: Vec::new(),
-            list_state,
+            list_state: RefCell::new(ls),
         }
     }
 }
@@ -283,11 +302,21 @@ enum PruneResult {
 }
 
 impl LayoutNode {
-    // ── Layout computation ───────────────────────────────────────────────────
+    // ── Zero-allocation tree traversal ───────────────────────────────────────
+    //
+    // Both traversal methods accept a closure rather than pushing into a Vec.
+    // This lets every call-site decide how to consume each (PaneId, Rect) pair:
+    // - collect into a Vec   (when all rects are needed, e.g. draw / resize_all)
+    // - early-exit search    (when only one rect is needed, e.g. new_pane_size)
+    // - accumulate a single  (e.g. move_focus — visits all, keeps running best)
+    //
+    // None of these paths allocate unless the caller explicitly pushes to a Vec.
 
-    fn collect_pane_rects(&self, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
+    /// Walk the entire subtree in document order, invoking `f(id, rect)` for
+    /// every leaf.  `area` is the rect assigned to this node by its parent.
+    fn walk_rects(&self, area: Rect, f: &mut impl FnMut(PaneId, Rect)) {
         match self {
-            LayoutNode::Pane(id) => out.push((*id, area)),
+            LayoutNode::Pane(id) => f(*id, area),
 
             LayoutNode::SplitHorizontal { left, right, ratio } => {
                 let chunks = Layout::default()
@@ -297,8 +326,8 @@ impl LayoutNode {
                         Constraint::Percentage(100 - ratio),
                     ])
                     .split(area);
-                left.collect_pane_rects(chunks[0], out);
-                right.collect_pane_rects(chunks[1], out);
+                left.walk_rects(chunks[0], f);
+                right.walk_rects(chunks[1], f);
             }
 
             LayoutNode::SplitVertical { top, bottom, ratio } => {
@@ -309,11 +338,11 @@ impl LayoutNode {
                         Constraint::Percentage(100 - ratio),
                     ])
                     .split(area);
-                top.collect_pane_rects(chunks[0], out);
-                bottom.collect_pane_rects(chunks[1], out);
+                top.walk_rects(chunks[0], f);
+                bottom.walk_rects(chunks[1], f);
             }
 
-            LayoutNode::Sentinel => {} // unreachable in normal operation
+            LayoutNode::Sentinel => {}
         }
     }
 
@@ -496,26 +525,31 @@ impl LayoutNode {
         }
     }
 
-    /// Return all PaneIds present in this subtree, in document order.
-    fn all_pane_ids(&self) -> Vec<PaneId> {
-        let mut out = Vec::new();
-        self.collect_ids(&mut out);
-        out
-    }
-
-    fn collect_ids(&self, out: &mut Vec<PaneId>) {
+    /// Walk the entire subtree invoking `f(id)` for every leaf, in document order.
+    fn walk_ids(&self, f: &mut impl FnMut(PaneId)) {
         match self {
-            LayoutNode::Pane(id)                           => out.push(*id),
+            LayoutNode::Pane(id)                             => f(*id),
             LayoutNode::SplitHorizontal { left, right, .. } => {
-                left.collect_ids(out);
-                right.collect_ids(out);
+                left.walk_ids(f);
+                right.walk_ids(f);
             }
-            LayoutNode::SplitVertical { top, bottom, .. }  => {
-                top.collect_ids(out);
-                bottom.collect_ids(out);
+            LayoutNode::SplitVertical { top, bottom, .. }   => {
+                top.walk_ids(f);
+                bottom.walk_ids(f);
             }
             LayoutNode::Sentinel => {}
         }
+    }
+
+    /// Convenience wrapper: collect all PaneIds into a Vec.
+    ///
+    /// Used by `close_pane` where the positional index of the target *within
+    /// the ordered sequence* is genuinely needed.  All other call-sites use
+    /// `walk_ids` directly.
+    fn all_pane_ids(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        self.walk_ids(&mut |id| out.push(id));
+        out
     }
 }
 
@@ -570,41 +604,42 @@ impl AppState {
     // ── Focus movement (unchanged from Phase 2) ──────────────────────────────
 
     fn move_focus(&mut self, area: Rect, dir: Dir) {
-        let mut rects = Vec::new();
-        self.layout.collect_pane_rects(area, &mut rects);
-
-        let cur = match rects.iter().find(|(id, _)| *id == self.focus) {
-            Some((_, r)) => *r,
-            None         => return,
+        // First pass: find the focused pane's rect — no allocation.
+        let focus_id = self.focus;
+        let mut cur_rect: Option<Rect> = None;
+        self.layout.walk_rects(area, &mut |id, rect| {
+            if id == focus_id { cur_rect = Some(rect); }
+        });
+        let cur = match cur_rect {
+            Some(r) => r,
+            None    => return,
         };
         let cx = centroid_x(cur);
         let cy = centroid_y(cur);
 
+        // Second pass: find the best directional neighbour — still no allocation.
         let mut best: Option<(PaneId, i32)> = None;
-
-        for (id, rect) in &rects {
-            if *id == self.focus { continue; }
-            let rx = centroid_x(*rect);
-            let ry = centroid_y(*rect);
-
+        self.layout.walk_rects(area, &mut |id, rect| {
+            if id == focus_id { return; }
+            let rx = centroid_x(rect);
+            let ry = centroid_y(rect);
             let ok = match dir {
-                Dir::Left  => rx < cx && ranges_overlap_v(cur, *rect),
-                Dir::Right => rx > cx && ranges_overlap_v(cur, *rect),
-                Dir::Up    => ry < cy && ranges_overlap_h(cur, *rect),
-                Dir::Down  => ry > cy && ranges_overlap_h(cur, *rect),
+                Dir::Left  => rx < cx && ranges_overlap_v(cur, rect),
+                Dir::Right => rx > cx && ranges_overlap_v(cur, rect),
+                Dir::Up    => ry < cy && ranges_overlap_h(cur, rect),
+                Dir::Down  => ry > cy && ranges_overlap_h(cur, rect),
             };
-            if !ok { continue; }
-
+            if !ok { return; }
             let dist = match dir {
                 Dir::Left | Dir::Right => (rx - cx).abs(),
                 Dir::Up   | Dir::Down  => (ry - cy).abs(),
             };
             match best {
-                None                       => best = Some((*id, dist)),
-                Some((_, bd)) if dist < bd => best = Some((*id, dist)),
+                None                       => best = Some((id, dist)),
+                Some((_, bd)) if dist < bd => best = Some((id, dist)),
                 _                          => {}
             }
-        }
+        });
 
         if let Some((new_focus, _)) = best {
             self.focus = new_focus;
@@ -615,19 +650,17 @@ impl AppState {
 
     /// Determines the best split direction based on the focused pane's current dimensions.
     fn smart_split_kind(&self, area: Rect, preferred: SplitKind) -> SplitKind {
-        let mut rects = Vec::new();
-        self.layout.collect_pane_rects(area, &mut rects);
-        let focus_rect = rects
-            .iter()
-            .find(|(id, _)| *id == self.focus)
-            .map(|(_, r)| *r)
-            .unwrap_or(area);
+        // Walk until we find the focused pane rect; stop immediately after.
+        let focus_id = self.focus;
+        let mut focus_rect = area;
+        self.layout.walk_rects(area, &mut |id, rect| {
+            if id == focus_id { focus_rect = rect; }
+        });
 
-        // Terminal fonts are usually ~2x as tall as they are wide. 
+        // Terminal fonts are usually ~2x as tall as they are wide.
         // 45 cols is very narrow. 12 rows is very short.
         match preferred {
             SplitKind::Vertical => {
-                // Prefers left/right split. Override if we are too narrow but have height.
                 if focus_rect.width < 45 && focus_rect.height >= 12 {
                     SplitKind::Horizontal
                 } else {
@@ -635,7 +668,6 @@ impl AppState {
                 }
             }
             SplitKind::Horizontal => {
-                // Prefers top/bottom split. Override if we are too short but have width.
                 if focus_rect.height < 12 && focus_rect.width >= 45 {
                     SplitKind::Vertical
                 } else {
@@ -706,24 +738,18 @@ impl AppState {
     /// Compute the PTY size that a newly created pane will have after splitting
     /// the focused pane.
     fn new_pane_size(&self, area: Rect, kind: SplitKind) -> (u16, u16) {
-        let mut rects = Vec::new();
-        self.layout.collect_pane_rects(area, &mut rects);
-
-        let focus_rect = rects
-            .iter()
-            .find(|(id, _)| *id == self.focus)
-            .map(|(_, r)| *r)
-            .unwrap_or(area);
-
+        let focus_id = self.focus;
+        let mut focus_rect = area;
+        self.layout.walk_rects(area, &mut |id, rect| {
+            if id == focus_id { focus_rect = rect; }
+        });
         match kind {
             SplitKind::Vertical => {
-                // New pane will be the right half.
                 let cols = (focus_rect.width / 2).saturating_sub(2).max(8);
                 let rows = focus_rect.height.saturating_sub(2).max(2);
                 (rows, cols)
             }
             SplitKind::Horizontal => {
-                // New pane will be the bottom half.
                 let rows = (focus_rect.height / 2).saturating_sub(2).max(2);
                 let cols = focus_rect.width.saturating_sub(2).max(8);
                 (rows, cols)
@@ -751,21 +777,17 @@ impl AppState {
         }
 
         // ── Choose the pane that will receive focus after removal ─────────
-        // We pick from surviving panes using document order; prefer the pane
-        // immediately before the target, falling back to the one after.
-        // Among all candidates, prefer a Terminal pane over an Explorer pane
-        // so that closing a pane never silently strands focus on the explorer
-        // (which swallows all regular keypresses).
-        let survivors: Vec<PaneId> = self.layout
-            .all_pane_ids()
-            .into_iter()
+        // Walk the tree exactly once to collect ordered ids; we need the
+        // positional index of `target` and the list of survivors, both of
+        // which fall out of a single traversal.
+        let all_ids = self.layout.all_pane_ids(); // one Vec, one walk
+        let target_pos = all_ids.iter().position(|id| *id == target).unwrap_or(0);
+        // survivors: all ids except the one being removed
+        let survivors: Vec<PaneId> = all_ids.iter()
+            .copied()
             .filter(|id| *id != target)
             .collect();
 
-        // Pick the last survivor that comes before target in document order,
-        // or the first overall.
-        let all_ids = self.layout.all_pane_ids();
-        let target_pos = all_ids.iter().position(|id| *id == target).unwrap_or(0);
         let positional_focus = if target_pos > 0 {
             all_ids[target_pos - 1]
         } else {
@@ -802,12 +824,15 @@ impl AppState {
     // ── Resize all panes ─────────────────────────────────────────────────────
 
     fn resize_all(&mut self, area: Rect) -> Result<()> {
-        let mut rects = Vec::new();
-        self.layout.collect_pane_rects(area, &mut rects);
-
-        for (id, rect) in rects {
+        // Collect (id, rows, cols) first so we don't hold a borrow on
+        // self.layout while mutably borrowing self.panes.
+        let mut to_resize: Vec<(PaneId, u16, u16)> = Vec::new();
+        self.layout.walk_rects(area, &mut |id, rect| {
             let rows = rect.height.saturating_sub(2).max(2);
             let cols = rect.width.saturating_sub(2).max(8);
+            to_resize.push((id, rows, cols));
+        });
+        for (id, rows, cols) in to_resize {
             if let Some(AppPane::Terminal(term)) = self.panes.get_mut(&id) {
                 term.resize(rows, cols)?;
             }
@@ -862,7 +887,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        execute!(io::stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste).context("enter alternate screen")?;
         Ok(Self)
     }
 }
@@ -870,7 +895,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
@@ -1057,11 +1082,8 @@ fn dispatch_input(
 ) -> Result<(bool, Option<(PaneId, Box<dyn Read + Send>)>)> {
 
     dlog(&format!(
-            "dispatch_input: key={:?} modifiers={:?} focus={} panes={:?}",
-            key.code,
-            key.modifiers,
-            state.focus,
-            state.panes.keys().collect::<Vec<_>>()
+        "dispatch_input: key={:?} modifiers={:?} focus={} n_panes={}",
+        key.code, key.modifiers, state.focus, state.panes.len()
     ));
 
     // ── 1. Intercept input if Overlay is active ──────────────────────────────
@@ -1190,15 +1212,15 @@ fn dispatch_input(
                 AppPane::Explorer(exp) => {
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => {
-                            let i = exp.list_state.selected().unwrap_or(0);
-                            if i < exp.entries.len().saturating_sub(1) { exp.list_state.select(Some(i + 1)); }
+                            let i = exp.list_state.borrow().selected().unwrap_or(0);
+                            if i < exp.entries.len().saturating_sub(1) { exp.list_state.borrow_mut().select(Some(i + 1)); }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            let i = exp.list_state.selected().unwrap_or(0);
-                            if i > 0 { exp.list_state.select(Some(i - 1)); }
+                            let i = exp.list_state.borrow().selected().unwrap_or(0);
+                            if i > 0 { exp.list_state.borrow_mut().select(Some(i - 1)); }
                         }
                         KeyCode::Char('D') => { // shift + 'd' to delete
-                            if let Some(i) = exp.list_state.selected() {
+                            if let Some(i) = exp.list_state.borrow().selected() {
                                 if let Some(entry) = exp.entries.get(i) {
                                     if entry.name != ".." {
                                         let mut path = exp.cwd.clone();
@@ -1215,7 +1237,7 @@ fn dispatch_input(
                             });
                         }
                         KeyCode::Enter => {
-                            if let Some(i) = exp.list_state.selected() {
+                            if let Some(i) = exp.list_state.borrow().selected() {
                                 if let Some(entry) = exp.entries.get(i) {
                                     let mut path = exp.cwd.clone();
                                     if entry.name == ".." {
@@ -1362,12 +1384,11 @@ fn draw(
         frame.render_widget(Paragraph::new(Line::from(hints)), bot_area);
 
         // ── Tiled panes ───────────────────────────────────────────────────
-        let mut pane_rects = Vec::new();
-        state.layout.collect_pane_rects(content_area, &mut pane_rects);
-
-        for (id, rect) in pane_rects {
-            let Some(pane) = state.panes.get(&id) else { continue };
-            let focused = id == state.focus;
+        // walk_rects drives rendering directly — no intermediate Vec.
+        let focus_id = state.focus;
+        state.layout.walk_rects(content_area, &mut |id, rect| {
+            let Some(pane) = state.panes.get(&id) else { return };
+            let focused = id == focus_id;
 
             let border_style = if focused {
                 Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
@@ -1411,12 +1432,15 @@ fn draw(
                         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
                         .highlight_symbol(">> ");
 
-                    // We need a mutable reference to state to render the selection highlight
-                    let mut state = exp.list_state.clone(); 
-                    frame.render_stateful_widget(list, inner, &mut state);
+                    // borrow_mut() gives the mutable reference ratatui needs
+                    // without cloning the ListState.
+                    frame.render_stateful_widget(
+                        list, inner,
+                        &mut *exp.list_state.borrow_mut(),
+                    );
                 }
             }
-        }
+        });
         // ── Draw Overlay (Always on top) ──────────────────────────────────
         if let Some(overlay) = &state.overlay {
             // A small centered box: 40% width, 3 lines tall
@@ -1481,7 +1505,7 @@ async fn run_event_loop(
                 if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&pane_id) {
                     exp.cwd = path;
                     exp.entries = entries;
-                    exp.list_state.select(Some(0)); // Reset selection to top
+                    exp.list_state.borrow_mut().select(Some(0));
                 }
                 draw(terminal, state)?;
             }
@@ -1493,7 +1517,7 @@ async fn run_event_loop(
             AppEvent::PtyExited { pane_id } => {
                 dlog(&format!("event_loop: PtyExited pane_id={pane_id}"));
                 let should_quit = state.close_pane(pane_id, area)?;
-                dlog(&format!("event_loop: after close_pane should_quit={should_quit} remaining_panes={:?}", state.panes.keys().collect::<Vec<_>>()));
+                dlog(&format!("event_loop: after close_pane should_quit={should_quit} remaining_panes={}", state.panes.len()));
                 if should_quit {
                     break;
                 }
@@ -1502,6 +1526,17 @@ async fn run_event_loop(
 
             // ── Input events ──────────────────────────────────────────────
             AppEvent::Input(ev) => match ev {
+                
+                // Fast-path for pasted text (prevents rendering 300 frames for 300 characters)
+                Event::Paste(text) => {
+                    if let Some(AppPane::Terminal(term)) = state.panes.get_mut(&state.focus) {
+                        // Forward the entire string to the PTY at once
+                        let _ = term.writer.write_all(text.as_bytes());
+                        let _ = term.writer.flush();
+                    }
+                    draw(terminal, state)?;
+                }
+
                 Event::Key(key_ev) => {
                     let (should_quit, new_pane) =
                         dispatch_input(state, area, key_ev, tx)?;
@@ -1622,7 +1657,7 @@ mod tests {
         let tree = LayoutNode::Pane(0);
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let mut rects = Vec::new();
-        tree.collect_pane_rects(area, &mut rects);
+        tree.walk_rects(area, &mut |id, rect| rects.push((id, rect)));
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].0, 0);
         assert_eq!(rects[0].1, area);
@@ -1637,7 +1672,7 @@ mod tests {
         };
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let mut rects = Vec::new();
-        tree.collect_pane_rects(area, &mut rects);
+        tree.walk_rects(area, &mut |id, rect| rects.push((id, rect)));
         assert_eq!(rects.len(), 2);
         // Left pane should be to the left of the right pane.
         assert!(centroid_x(rects[0].1) < centroid_x(rects[1].1));
