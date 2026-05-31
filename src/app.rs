@@ -243,8 +243,6 @@ impl AppState {
             if id == focus_id { focus_rect = rect; }
         });
 
-        // ── The Safety Limiter ──
-        // Refuse to split if the focused pane is already too small
         match kind {
             SplitKind::Vertical if focus_rect.width < 12 => return Ok(None),
             SplitKind::Horizontal if focus_rect.height < 6 => return Ok(None),
@@ -259,35 +257,34 @@ impl AppState {
         let (pane, reader) = TerminalPane::new(new_id, rows, cols, cmd)?;
         self.panes.insert(new_id, AppPane::Terminal(pane));
 
-        // Mutate the tree: replace Pane(focus) with Split{Pane(focus), Pane(new)}.
         self.layout.split_pane(self.focus, new_id, kind);
+        self.focus = new_id;
 
-        // Also resize the *existing* focused pane to its new (halved) rect.
-        if let Some(AppPane::Terminal(existing_term)) = self.panes.get_mut(&self.focus) {
-            existing_term.resize(rows, cols)?;
+        // If we are in GUI mode, spawn a floating window for the new pane immediately
+        if self.mode == DesktopMode::Gui {
+            let n = self.floating_windows.len() as u16;
+            let rect = cascade_rect(n, area);
+            self.floating_windows.push(FloatingWindow::new(new_id, rect));
         }
 
-        // Shift focus to the newly created pane.
-        self.focus = new_id;
+        // Force dimensions to sync regardless of mode
+        let _ = self.resize_all(area);
 
         Ok(Some((new_id, reader)))
     }
 
-    /// Split the focused pane and spawn a File Explorer.
     pub fn do_split_explorer(
         &mut self,
         area: Rect,
         kind: SplitKind,
         tx:   mpsc::Sender<AppEvent>,
     ) -> Result<()> {
-
         let focus_id = self.focus;
         let mut focus_rect = area;
         self.layout.walk_rects(area, &mut |id, rect| {
             if id == focus_id { focus_rect = rect; }
         });
 
-        // ── The Safety Limiter ──
         match kind {
             SplitKind::Vertical if focus_rect.width < 12 => return Ok(()),
             SplitKind::Horizontal if focus_rect.height < 6 => return Ok(()),
@@ -297,8 +294,6 @@ impl AppState {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let (rows, cols) = self.new_pane_size(area, kind);
-
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/"));
@@ -306,14 +301,16 @@ impl AppState {
 
         self.panes.insert(new_id, AppPane::Explorer(explorer));
         self.layout.split_pane(self.focus, new_id, kind);
-
-        if let Some(AppPane::Terminal(existing)) = self.panes.get_mut(&self.focus) {
-            existing.resize(rows, cols)?;
-        }
-
         self.focus = new_id;
 
-        // Trigger initial async read.
+        if self.mode == DesktopMode::Gui {
+            let n = self.floating_windows.len() as u16;
+            let rect = cascade_rect(n, area);
+            self.floating_windows.push(FloatingWindow::new(new_id, rect));
+        }
+
+        let _ = self.resize_all(area);
+
         spawn_dir_read(new_id, home, tx);
 
         Ok(())
@@ -413,14 +410,25 @@ impl AppState {
     // ── Resize all panes ─────────────────────────────────────────────────────
 
     pub fn resize_all(&mut self, area: Rect) -> Result<()> {
-        // Collect (id, rows, cols) first so we don't hold a borrow on
-        // self.layout while mutably borrowing self.panes.
         let mut to_resize: Vec<(PaneId, u16, u16)> = Vec::new();
-        self.layout.walk_rects(area, &mut |id, rect| {
-            let rows = rect.height.saturating_sub(2).max(2);
-            let cols = rect.width.saturating_sub(2).max(8);
-            to_resize.push((id, rows, cols));
-        });
+        
+        match self.mode {
+            DesktopMode::Tiling => {
+                self.layout.walk_rects(area, &mut |id, rect| {
+                    let rows = rect.height.saturating_sub(2).max(2);
+                    let cols = rect.width.saturating_sub(2).max(8);
+                    to_resize.push((id, rows, cols));
+                });
+            }
+            DesktopMode::Gui => {
+                for win in &self.floating_windows {
+                    let rows = win.area.height.saturating_sub(2).max(2);
+                    let cols = win.area.width.saturating_sub(2).max(8);
+                    to_resize.push((win.id, rows, cols));
+                }
+            }
+        }
+        
         for (id, rows, cols) in to_resize {
             if let Some(AppPane::Terminal(term)) = self.panes.get_mut(&id) {
                 term.resize(rows, cols)?;
@@ -521,22 +529,28 @@ impl AppState {
             DesktopMode::Tiling => {
                 self.mode = DesktopMode::Gui;
 
-                // Populate the window stack if it has never been built.
-                if self.floating_windows.is_empty() {
-                    let ids = self.layout.all_pane_ids();
-                    for (n, id) in ids.into_iter().enumerate() {
-                        let rect = cascade_rect(n as u16, content_area);
+                let ids = self.layout.all_pane_ids();
+                let existing_count = self.floating_windows.len() as u16;
+                let mut added = 0;
+
+                for id in ids {
+                    let already_exists = self.floating_windows.iter().any(|w| w.id == id);
+                    if !already_exists {
+                        let rect = cascade_rect(existing_count + added, content_area);
                         self.floating_windows.push(FloatingWindow::new(id, rect));
-                        dlog(&format!(
-                            "toggle_gui: cascade window {n} → pane {id} at {:?}",
-                            rect
-                        ));
+                        added += 1;
+                        dlog(&format!("toggle_gui: added new window for pane {id}"));
                     }
                 }
+                
+                // Force all PTYs to adopt their new floating dimensions
+                let _ = self.resize_all(content_area);
             }
 
             DesktopMode::Gui => {
                 self.mode = DesktopMode::Tiling;
+                // Force all PTYs to return to their strict tiling dimensions
+                let _ = self.resize_all(content_area);
             }
         }
     }

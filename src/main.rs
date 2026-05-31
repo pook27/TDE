@@ -102,13 +102,23 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        // 1. Disable features BEFORE leaving the alternate screen so the terminal
+        //    correctly applies them to the active buffer.
         let _ = execute!(
             io::stdout(),
             DisableMouseCapture,
             DisableBracketedPaste,
+            crossterm::cursor::Show,
             LeaveAlternateScreen,
         );
+        
+        // 2. Give the terminal emulator a tiny fraction of a second to process 
+        //    the disable sequences. This guarantees any in-flight mouse movements 
+        //    are swallowed before we drop raw mode and return to the shell.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        
+        // 3. Finally, release the TTY back to the OS.
+        let _ = disable_raw_mode();
     }
 }
 
