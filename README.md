@@ -35,14 +35,14 @@ TDE uses direct `Alt` (Meta) keybindings for zero-latency, stateless navigation,
 | `Alt+V` | Vertical Split (side-by-side) |
 | `Alt+S` | Horizontal Split (top-and-bottom) |
 | `Alt+X` | Close focused pane |
-| `Alt+H/J/K/L` | Move focus (Left/Down/Up/Right) |
+| `Alt+Arrow Keys` | Move focus (Left/Down/Up/Right) |
 | `Alt+Q` | Quit TDE |
 
 ### Explorer Shortcuts (When focused on File Explorer)
 
 | Key | Action |
 | --- | --- |
-| `j / k` or `Up / Down` | Navigate files |
+| `Up / Down` | Navigate files |
 | `Enter` | Open file in `nvim` / Enter directory |
 | `c` | Create new file (add `/` to end for directory) |
 | `Shift+D` | Delete file/directory |
