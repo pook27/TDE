@@ -67,16 +67,24 @@
 //!        └─ Prefix / q       → quit
 //! ```
 
+pub mod layout;
+pub mod vfs;
+
 use std::{
-    cell::RefCell,
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Read, Write},
-    mem,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
+
+use layout::{
+    centered_rect, centroid_x, centroid_y,
+    ranges_overlap_h, ranges_overlap_v,
+    Dir, LayoutNode, PaneId, SplitKind,
+};
+use vfs::{ExplorerEntry, ExplorerPane, spawn_dir_read};
 
 // ── Debug logger ─────────────────────────────────────────────────────────────
 // Writes to /tmp/tde_debug.log. We cannot use stdout (ratatui owns it) or
@@ -127,7 +135,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, List, ListItem, ListState, Clear},
+    widgets::{Block, Borders, Paragraph, List, ListItem, Clear},
     Terminal,
 };
 use tokio::sync::mpsc;
@@ -137,7 +145,6 @@ use tui_term::widget::PseudoTerminal;
 // § 1  Primitive types
 // ═══════════════════════════════════════════════════════════════════════════════
 
-type PaneId = u32;
 type SharedParser = Arc<Mutex<vt100::Parser>>;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -152,29 +159,8 @@ enum AppEvent {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 3  Direction
+// § 4  Split kind  →  see layout.rs
 // ═══════════════════════════════════════════════════════════════════════════════
-
-#[derive(Clone, Copy, Debug)]
-enum Dir {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// § 4  Split kind
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Which axis to split on.
-#[derive(Clone, Copy, Debug)]
-enum SplitKind {
-    /// `v` key: split left/right → SplitHorizontal; new pane on the right.
-    Vertical,
-    /// `s` key: split top/bottom → SplitVertical; new pane on the bottom.
-    Horizontal,
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 6  TerminalPane
@@ -236,38 +222,10 @@ impl Drop for TerminalPane {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 6.5  Explorer & Generic Panes
+// § 6.5  Generic pane discriminant
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone)]
-struct ExplorerEntry {
-    name: String,
-    is_dir: bool,
-}
-
-struct ExplorerPane {
-    id: PaneId,
-    cwd: PathBuf,
-    entries: Vec<ExplorerEntry>,
-    /// `RefCell` lets `draw()` (which takes `&AppState`) call
-    /// `render_stateful_widget` without cloning the selection state.
-    /// Interior mutability is safe here: draw() is always called from the
-    /// single-threaded event loop, never concurrently with input handlers.
-    list_state: RefCell<ListState>,
-}
-
-impl ExplorerPane {
-    fn new(id: PaneId, path: PathBuf) -> Self {
-        let mut ls = ListState::default();
-        ls.select(Some(0));
-        Self {
-            id,
-            cwd: path,
-            entries: Vec::new(),
-            list_state: RefCell::new(ls),
-        }
-    }
-}
+// ExplorerEntry and ExplorerPane live in vfs.rs; imported above.
 
 enum AppPane {
     Terminal(TerminalPane),
@@ -275,288 +233,8 @@ enum AppPane {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 7  Layout tree
+// § 7  Layout tree  →  see layout.rs
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Binary tiling tree.  Leaves hold a `PaneId`; interior nodes hold children.
-///
-/// The `Sentinel` variant exists solely as a `mem::replace` placeholder that is
-/// never visible to any other code path — it is always immediately overwritten.
-/// It is not `pub` and contains no data, so it imposes zero cost.
-enum LayoutNode {
-    Pane(PaneId),
-    SplitHorizontal { left: Box<LayoutNode>, right: Box<LayoutNode>, ratio: u16 },
-    SplitVertical   { top:  Box<LayoutNode>, bottom: Box<LayoutNode>, ratio: u16 },
-    /// Private placeholder used during tree mutation only.  Must never persist.
-    Sentinel,
-}
-
-// ── Return type for the recursive prune helper ────────────────────────────────
-
-/// Result of attempting to remove `target` from a subtree.
-enum PruneResult {
-    /// Target was not found in this subtree; the caller need not change anything.
-    NotFound,
-    /// Target was found and removed.  `survivor` is the node that should
-    /// replace the one that was pruned:
-    ///
-    /// - `Some(node)` → replace the pruned node (or its parent split) with this.
-    /// - `None`       → the node that was pruned *was* a `Sentinel` placeholder;
-    ///                  this never happens for real pane ids.
-    Pruned { survivor: Option<Box<LayoutNode>> },
-}
-
-impl LayoutNode {
-    // ── Zero-allocation tree traversal ───────────────────────────────────────
-    //
-    // Both traversal methods accept a closure rather than pushing into a Vec.
-    // This lets every call-site decide how to consume each (PaneId, Rect) pair:
-    // - collect into a Vec   (when all rects are needed, e.g. draw / resize_all)
-    // - early-exit search    (when only one rect is needed, e.g. new_pane_size)
-    // - accumulate a single  (e.g. move_focus — visits all, keeps running best)
-    //
-    // None of these paths allocate unless the caller explicitly pushes to a Vec.
-
-    /// Walk the entire subtree in document order, invoking `f(id, rect)` for
-    /// every leaf.  `area` is the rect assigned to this node by its parent.
-    fn walk_rects(&self, area: Rect, f: &mut impl FnMut(PaneId, Rect)) {
-        match self {
-            LayoutNode::Pane(id) => f(*id, area),
-
-            LayoutNode::SplitHorizontal { left, right, ratio } => {
-                let chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(*ratio),
-                        Constraint::Percentage(100 - ratio),
-                    ])
-                    .split(area);
-                left.walk_rects(chunks[0], f);
-                right.walk_rects(chunks[1], f);
-            }
-
-            LayoutNode::SplitVertical { top, bottom, ratio } => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(*ratio),
-                        Constraint::Percentage(100 - ratio),
-                    ])
-                    .split(area);
-                top.walk_rects(chunks[0], f);
-                bottom.walk_rects(chunks[1], f);
-            }
-
-            LayoutNode::Sentinel => {}
-        }
-    }
-
-    // ── Tree mutation: split ──────────────────────────────────────────────────
-
-    /// Walk the tree until `LayoutNode::Pane(target)` is found, then replace
-    /// it with a new split node containing both the old pane and `new_id`.
-    ///
-    /// Returns `true` if the target was found and the split performed.
-    ///
-    /// ## mem::replace strategy
-    ///
-    /// We cannot move out of `self` when `self` is `&mut LayoutNode` (it's
-    /// behind a reference).  `mem::replace` lets us swap in a `Sentinel`
-    /// placeholder, take ownership of the old value, build the new split node
-    /// from it, then write the new node back into `*self`.  The Sentinel is
-    /// never observable outside this function because we always overwrite it
-    /// before returning.
-    fn split_pane(&mut self, target: PaneId, new_id: PaneId, kind: SplitKind) -> bool {
-        match self {
-            // ── Leaf: is this the target? ─────────────────────────────────
-            LayoutNode::Pane(id) if *id == target => {
-                // Swap self out, leaving a Sentinel in place temporarily.
-                let old = mem::replace(self, LayoutNode::Sentinel);
-                // Build the replacement split node.
-                *self = match kind {
-                    SplitKind::Vertical => LayoutNode::SplitHorizontal {
-                        left:  Box::new(old),
-                        right: Box::new(LayoutNode::Pane(new_id)),
-                        ratio: 50,
-                    },
-                    SplitKind::Horizontal => LayoutNode::SplitVertical {
-                        top:    Box::new(old),
-                        bottom: Box::new(LayoutNode::Pane(new_id)),
-                        ratio:  50,
-                    },
-                };
-                true
-            }
-
-            // ── Leaf: wrong target ────────────────────────────────────────
-            LayoutNode::Pane(_) => false,
-
-            // ── Interior: delegate to children ───────────────────────────
-            LayoutNode::SplitHorizontal { left, right, .. } => {
-                left.split_pane(target, new_id, kind)
-                    || right.split_pane(target, new_id, kind)
-            }
-            LayoutNode::SplitVertical { top, bottom, .. } => {
-                top.split_pane(target, new_id, kind)
-                    || bottom.split_pane(target, new_id, kind)
-            }
-
-            LayoutNode::Sentinel => false, // unreachable
-        }
-    }
-
-    // ── Tree mutation: prune ──────────────────────────────────────────────────
-
-    /// Recursively remove `LayoutNode::Pane(target)` from the tree.
-    ///
-    /// The caller is responsible for replacing *its own* reference to `self`
-    /// with the `survivor` returned by `PruneResult::Pruned`.
-    ///
-    /// ## How split-node replacement works
-    ///
-    /// When a split finds that one of its children was pruned, it needs to
-    /// replace *itself* with the surviving sibling.  Because `prune_pane` takes
-    /// `&mut self`, we again use `mem::replace`:
-    ///
-    /// 1. Swap `self` → `Sentinel`.
-    /// 2. Destructure the old split value (now owned).
-    /// 3. Write `*self = *surviving_sibling` (or keep the updated split).
-    fn prune_pane(&mut self, target: PaneId) -> PruneResult {
-        match self {
-            // ── Leaf: is this the target? ─────────────────────────────────
-            LayoutNode::Pane(id) if *id == target => {
-                // Signal to the caller: replace me with my sibling.
-                // We do NOT modify `self` here; the caller (a split arm below,
-                // or AppState::prune) will overwrite us.
-                PruneResult::Pruned { survivor: None }
-            }
-
-            LayoutNode::Pane(_) => PruneResult::NotFound,
-
-            // ── SplitHorizontal ───────────────────────────────────────────
-            LayoutNode::SplitHorizontal { left, right, .. } => {
-                // Try left child first.
-                match left.prune_pane(target) {
-                    PruneResult::Pruned { survivor: None } => {
-                        // Left leaf was the target.  Replace this whole split
-                        // with the right child.
-                        let old_split = mem::replace(self, LayoutNode::Sentinel);
-                        let right_child = match old_split {
-                            LayoutNode::SplitHorizontal { right, .. } => right,
-                            _ => unreachable!(),
-                        };
-                        *self = *right_child;
-                        PruneResult::Pruned { survivor: None }
-                        // Returning None tells *our* parent: replace your
-                        // reference to us with us (we've already updated *self).
-                        // The parent's job is already done.
-                    }
-
-                    PruneResult::Pruned { survivor: Some(new_left) } => {
-                        // A deeper node was pruned; left sub-tree was replaced.
-                        *left = new_left;
-                        // This split node itself is unchanged in structure.
-                        PruneResult::Pruned { survivor: None }
-                    }
-
-                    PruneResult::NotFound => {
-                        // Try right child.
-                        match right.prune_pane(target) {
-                            PruneResult::Pruned { survivor: None } => {
-                                // Right leaf was the target.  Replace this split
-                                // with the left child.
-                                let old_split = mem::replace(self, LayoutNode::Sentinel);
-                                let left_child = match old_split {
-                                    LayoutNode::SplitHorizontal { left, .. } => left,
-                                    _ => unreachable!(),
-                                };
-                                *self = *left_child;
-                                PruneResult::Pruned { survivor: None }
-                            }
-
-                            PruneResult::Pruned { survivor: Some(new_right) } => {
-                                *right = new_right;
-                                PruneResult::Pruned { survivor: None }
-                            }
-
-                            PruneResult::NotFound => PruneResult::NotFound,
-                        }
-                    }
-                }
-            }
-
-            // ── SplitVertical (mirror of SplitHorizontal) ─────────────────
-            LayoutNode::SplitVertical { top, bottom, .. } => {
-                match top.prune_pane(target) {
-                    PruneResult::Pruned { survivor: None } => {
-                        let old_split = mem::replace(self, LayoutNode::Sentinel);
-                        let bottom_child = match old_split {
-                            LayoutNode::SplitVertical { bottom, .. } => bottom,
-                            _ => unreachable!(),
-                        };
-                        *self = *bottom_child;
-                        PruneResult::Pruned { survivor: None }
-                    }
-
-                    PruneResult::Pruned { survivor: Some(new_top) } => {
-                        *top = new_top;
-                        PruneResult::Pruned { survivor: None }
-                    }
-
-                    PruneResult::NotFound => {
-                        match bottom.prune_pane(target) {
-                            PruneResult::Pruned { survivor: None } => {
-                                let old_split = mem::replace(self, LayoutNode::Sentinel);
-                                let top_child = match old_split {
-                                    LayoutNode::SplitVertical { top, .. } => top,
-                                    _ => unreachable!(),
-                                };
-                                *self = *top_child;
-                                PruneResult::Pruned { survivor: None }
-                            }
-
-                            PruneResult::Pruned { survivor: Some(new_bottom) } => {
-                                *bottom = new_bottom;
-                                PruneResult::Pruned { survivor: None }
-                            }
-
-                            PruneResult::NotFound => PruneResult::NotFound,
-                        }
-                    }
-                }
-            }
-
-            LayoutNode::Sentinel => PruneResult::NotFound,
-        }
-    }
-
-    /// Walk the entire subtree invoking `f(id)` for every leaf, in document order.
-    fn walk_ids(&self, f: &mut impl FnMut(PaneId)) {
-        match self {
-            LayoutNode::Pane(id)                             => f(*id),
-            LayoutNode::SplitHorizontal { left, right, .. } => {
-                left.walk_ids(f);
-                right.walk_ids(f);
-            }
-            LayoutNode::SplitVertical { top, bottom, .. }   => {
-                top.walk_ids(f);
-                bottom.walk_ids(f);
-            }
-            LayoutNode::Sentinel => {}
-        }
-    }
-
-    /// Convenience wrapper: collect all PaneIds into a Vec.
-    ///
-    /// Used by `close_pane` where the positional index of the target *within
-    /// the ordered sequence* is genuinely needed.  All other call-sites use
-    /// `walk_ids` directly.
-    fn all_pane_ids(&self) -> Vec<PaneId> {
-        let mut out = Vec::new();
-        self.walk_ids(&mut |id| out.push(id));
-        out
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 8  AppState
@@ -874,41 +552,11 @@ impl AppState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 9  Geometry helpers
+// § 9  Geometry helpers  →  see layout.rs
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn centroid_x(r: Rect) -> i32 { (r.x as i32) + (r.width  as i32) / 2 }
-fn centroid_y(r: Rect) -> i32 { (r.y as i32) + (r.height as i32) / 2 }
-
-/// Helper to create a centered bounding box for floating overlays
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn ranges_overlap_v(a: Rect, b: Rect) -> bool {
-    (a.y as i32) < (b.y + b.height) as i32
-        && (b.y as i32) < (a.y + a.height) as i32
-}
-fn ranges_overlap_h(a: Rect, b: Rect) -> bool {
-    (a.x as i32) < (b.x + b.width) as i32
-        && (b.x as i32) < (a.x + a.width) as i32
-}
+// centroid_x, centroid_y, centered_rect, ranges_overlap_v, ranges_overlap_h
+// are imported from layout:: at the top of this file.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 10  RAII terminal guard
@@ -997,31 +645,7 @@ fn spawn_pane_reader(
     });
 }
 
-fn spawn_dir_read(pane_id: PaneId, path: PathBuf, tx: mpsc::Sender<AppEvent>) {
-    tokio::spawn(async move {
-        let mut entries = Vec::new();
-
-        // Always add a way to go up a directory, unless we are at root
-        if path.parent().is_some() {
-            entries.push(ExplorerEntry { name: "..".to_string(), is_dir: true });
-        }
-
-        if let Ok(mut read_dir) = tokio::fs::read_dir(&path).await {
-            while let Ok(Some(entry)) = read_dir.next_entry().await {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                entries.push(ExplorerEntry { name, is_dir });
-            }
-        }
-
-        // Sort: Directories first, then alphabetical
-        entries.sort_by(|a, b| {
-            b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
-        });
-
-        let _ = tx.send(AppEvent::ExplorerUpdate { pane_id, path, entries }).await;
-    });
-}
+// spawn_dir_read lives in vfs.rs and is imported above.
 
 async fn input_task(tx: mpsc::Sender<AppEvent>) {
     let mut iteration = 0u32;
@@ -1344,6 +968,8 @@ mod theme {
     pub const TITLE_BADGE_BG:  Color = Color::Cyan;
     pub const KEY_HINT:        Color = Color::Yellow;
     pub const DIM_TEXT:        Color = Color::DarkGray;
+    pub const PREFIX_FG:       Color = Color::Black;
+    pub const PREFIX_BG:       Color = Color::Yellow;
 }
 
 fn draw(
