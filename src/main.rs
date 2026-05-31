@@ -69,13 +69,15 @@
 
 pub mod layout;
 pub mod vfs;
+pub mod pty;
+pub mod input;
 
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -85,6 +87,8 @@ use layout::{
     Dir, LayoutNode, PaneId, SplitKind,
 };
 use vfs::{ExplorerEntry, ExplorerPane, spawn_dir_read};
+use pty::{TerminalPane, spawn_pane_reader};
+use input::dispatch_input;
 
 // ── Debug logger ─────────────────────────────────────────────────────────────
 // Writes to /tmp/tde_debug.log. We cannot use stdout (ratatui owns it) or
@@ -120,8 +124,7 @@ fn dlog(msg: &str) {
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEventKind,
+        Event, EventStream, MouseButton, MouseEventKind,
         EnableBracketedPaste, DisableBracketedPaste,
         EnableMouseCapture, DisableMouseCapture,
     },
@@ -129,7 +132,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::StreamExt;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::CommandBuilder;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -142,16 +145,10 @@ use tokio::sync::mpsc;
 use tui_term::widget::PseudoTerminal;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 1  Primitive types
-// ═══════════════════════════════════════════════════════════════════════════════
-
-type SharedParser = Arc<Mutex<vt100::Parser>>;
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // § 2  Events
 // ═══════════════════════════════════════════════════════════════════════════════
 
-enum AppEvent {
+pub enum AppEvent {
     PtyOutput { pane_id: PaneId, bytes: Vec<u8> },
     PtyExited { pane_id: PaneId },
     Input(Event),
@@ -163,63 +160,11 @@ enum AppEvent {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 6  TerminalPane
+// § 6  TerminalPane  →  see pty.rs
 // ═══════════════════════════════════════════════════════════════════════════════
 
-struct TerminalPane {
-    id: PaneId,
-    /// Dropping `_child` sends SIGHUP to the shell and waits — exactly what we
-    /// want when a pane is removed from the HashMap.
-    _child: Box<dyn Child + Send + Sync>,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    parser: SharedParser,
-}
-
-impl TerminalPane {
-    fn new(id: PaneId, rows: u16, cols: u16, custom_cmd: Option<CommandBuilder>) -> Result<(Self, Box<dyn Read + Send>)> {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .context("openpty")?;
-
-        let cmd = custom_cmd.unwrap_or_else(shell_cmd);
-        let child  = pair.slave.spawn_command(cmd).context("spawn shell")?;
-        let reader = pair.master.try_clone_reader().context("clone PTY reader")?;
-        let writer = pair.master.take_writer().context("take PTY writer")?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
-
-        Ok((Self { id, _child: child, master: pair.master, writer, parser }, reader))
-    }
-
-    fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        self.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .context("resize PTY")?;
-        let mut g = self.parser.lock().expect("parser poisoned");
-        *g = vt100::Parser::new(rows, cols, 0);
-        Ok(())
-    }
-}
-
-impl Drop for TerminalPane {
-    fn drop(&mut self) {
-        dlog(&format!("TerminalPane::drop pane_id={}", self.id));
-        // Attempt a clean exit first. We inject an Escape key followed by the 
-        // standard Vim force-quit command. This allows the child process to 
-        // close its own file descriptors cleanly, avoiding OS-level PTY panics.
-        let _ = self.writer.write_all(b"\x1b:qa!\r");
-        let _ = self.writer.flush();
-
-        // Give the process a brief window to exit gracefully
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Force kill as a fallback if it was unresponsive
-        dlog(&format!("TerminalPane::drop killing pane_id={}", self.id));
-        let _ = self._child.kill();
-        dlog(&format!("TerminalPane::drop done pane_id={}", self.id));
-    }
-}
+// TerminalPane, SharedParser, shell_cmd, and spawn_pane_reader live in pty.rs
+// and are imported above.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 6.5  Generic pane discriminant
@@ -227,7 +172,7 @@ impl Drop for TerminalPane {
 
 // ExplorerEntry and ExplorerPane live in vfs.rs; imported above.
 
-enum AppPane {
+pub enum AppPane {
     Terminal(TerminalPane),
     Explorer(ExplorerPane),
 }
@@ -241,19 +186,19 @@ enum AppPane {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone)]
-enum OverlayAction {
+pub enum OverlayAction {
     /// Alt+Space to spawn a custom command
     SpawnCommand,
     /// 'c' in Explorer to create a file/directory
     CreateFile { cwd: PathBuf },
 }
 
-struct AppOverlay {
+pub struct AppOverlay {
     action: OverlayAction,
     input: String,
 }
 
-struct AppState {
+pub struct AppState {
     layout:  LayoutNode,
     panes:   HashMap<PaneId, AppPane>,
     focus:   PaneId,
@@ -590,60 +535,10 @@ impl Drop for TerminalGuard {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 11  Shell helper
+// § 11  Shell helper + § 12  Background I/O tasks  →  see pty.rs
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn shell_cmd() -> CommandBuilder {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.env("TERM", "xterm-256color");
-    cmd
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// § 12  Background I/O tasks
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn spawn_pane_reader(
-    pane_id: PaneId,
-    mut reader: Box<dyn Read + Send>,
-    tx: mpsc::Sender<AppEvent>,
-) {
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => {
-                    // Keep retrying the send for PtyExited — it is a small,
-                    // infrequent message and we must not silently drop it.
-                    // If the channel is full, spin-wait briefly rather than
-                    // blocking indefinitely with blocking_send on a saturated
-                    // channel (which would hold the tx clone alive forever).
-                    loop {
-                        match tx.try_send(AppEvent::PtyExited { pane_id }) {
-                            Ok(_) => break,
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                std::thread::sleep(std::time::Duration::from_millis(5));
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                        }
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    // PTY output: prefer non-blocking. If the channel is full,
-                    // drop this frame — the terminal will simply not update for
-                    // one read cycle, which is far better than stalling the
-                    // reader thread and blocking the PTY pipe.
-                    let _ = tx.try_send(AppEvent::PtyOutput {
-                        pane_id,
-                        bytes: buf[..n].to_vec(),
-                    });
-                }
-            }
-        }
-    });
-}
+// shell_cmd and spawn_pane_reader live in pty.rs and are imported above.
 
 // spawn_dir_read lives in vfs.rs and is imported above.
 
@@ -683,278 +578,11 @@ async fn input_task(tx: mpsc::Sender<AppEvent>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 13  Key → PTY byte translation (unchanged from Phase 1)
+// § 13  Key → PTY byte translation  +  § 14  Input dispatch  →  see input.rs
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
-    let b = match key.code {
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            vec![(c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1) & 0x1f]
-        }
-        KeyCode::Char(c)   => c.to_string().into_bytes(),
-        KeyCode::Enter     => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Delete    => vec![0x1b, b'[', b'3', b'~'],
-        KeyCode::Tab       => vec![b'\t'],
-        KeyCode::Esc       => vec![0x1b],
-        KeyCode::Up        => vec![0x1b, b'[', b'A'],
-        KeyCode::Down      => vec![0x1b, b'[', b'B'],
-        KeyCode::Right     => vec![0x1b, b'[', b'C'],
-        KeyCode::Left      => vec![0x1b, b'[', b'D'],
-        KeyCode::PageUp    => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown  => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Home      => vec![0x1b, b'[', b'H'],
-        KeyCode::End       => vec![0x1b, b'[', b'F'],
-        KeyCode::F(1)      => vec![0x1b, b'O', b'P'],
-        KeyCode::F(2)      => vec![0x1b, b'O', b'Q'],
-        KeyCode::F(3)      => vec![0x1b, b'O', b'R'],
-        KeyCode::F(4)      => vec![0x1b, b'O', b'S'],
-        KeyCode::F(5)      => vec![0x1b, b'[', b'1', b'5', b'~'],
-        KeyCode::F(6)      => vec![0x1b, b'[', b'1', b'7', b'~'],
-        KeyCode::F(7)      => vec![0x1b, b'[', b'1', b'8', b'~'],
-        KeyCode::F(8)      => vec![0x1b, b'[', b'1', b'9', b'~'],
-        KeyCode::F(9)      => vec![0x1b, b'[', b'2', b'0', b'~'],
-        KeyCode::F(10)     => vec![0x1b, b'[', b'2', b'1', b'~'],
-        KeyCode::F(11)     => vec![0x1b, b'[', b'2', b'3', b'~'],
-        KeyCode::F(12)     => vec![0x1b, b'[', b'2', b'4', b'~'],
-        _ => return None,
-    };
-    Some(b)
-}
-
-fn forward_key(key: KeyEvent, writer: &mut Box<dyn Write + Send>) -> Result<()> {
-    if let Some(bytes) = key_to_bytes(key) {
-        writer.write_all(&bytes).context("write to PTY")?;
-        writer.flush().context("flush PTY")?;
-    }
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// § 14  Input dispatch
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Process one key event.
-///
-/// Returns `(should_quit, Option<(PaneId, reader)>)`:
-/// - `should_quit` → event loop must break.
-/// - `Some((id, reader))` → a new pane was just created; caller must spawn its
-///   reader thread before the next draw call.
-fn dispatch_input(
-    state: &mut AppState,
-    area: Rect,
-    key: KeyEvent,
-    tx: &mpsc::Sender<AppEvent>, // Prefix unused with an underscore since we don't need it right now
-) -> Result<(bool, Option<(PaneId, Box<dyn Read + Send>)>)> {
-
-    dlog(&format!(
-        "dispatch_input: key={:?} modifiers={:?} focus={} n_panes={}",
-        key.code, key.modifiers, state.focus, state.panes.len()
-    ));
-
-    // ── 1. Intercept input if Overlay is active ──────────────────────────────
-    if let Some(mut overlay) = state.overlay.take() {
-        match key.code {
-            KeyCode::Esc => {
-                // Cancel overlay (state.overlay remains None)
-            }
-            KeyCode::Backspace => {
-                overlay.input.pop();
-                state.overlay = Some(overlay);
-            }
-            KeyCode::Char(c) => {
-                overlay.input.push(c);
-                state.overlay = Some(overlay);
-            }
-            KeyCode::Enter => {
-                // Execute the overlay action!
-                match overlay.action {
-                    OverlayAction::SpawnCommand => {
-                        if !overlay.input.trim().is_empty() {
-                            // Basic command parsing (splits by space)
-                            let mut parts = overlay.input.trim().split_whitespace();
-                            let mut cmd = CommandBuilder::new(parts.next().unwrap());
-                            for arg in parts { cmd.arg(arg); }
-                            cmd.env("TERM", "xterm-256color");
-
-                            // Smart split: prefers vertical, but flips to horizontal if cramped
-                            let kind = state.smart_split_kind(area, SplitKind::Vertical);
-                            let (new_id, reader) = state.do_split(area, kind, Some(cmd))?;
-                            return Ok((false, Some((new_id, reader))));
-                        }
-                    }
-                    OverlayAction::CreateFile { cwd } => {
-                        if !overlay.input.trim().is_empty() {
-                            let mut path = cwd.clone();
-                            path.push(overlay.input.trim());
-
-                            // If it ends with '/', make a directory. Otherwise, make an empty file.
-                            if overlay.input.ends_with('/') {
-                                let _ = std::fs::create_dir_all(&path);
-                            } else {
-                                let _ = std::fs::File::create(&path);
-                            }
-
-                            // Trigger an async refresh of the focused Explorer pane
-                            if let Some(AppPane::Explorer(exp)) = state.panes.get(&state.focus) {
-                                spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
-                // Ignore other keys but keep overlay open
-                state.overlay = Some(overlay);
-            }
-        }
-        return Ok((false, None));
-    }
-
-    // Check if the ALT modifier is pressed
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        match key.code {
-            // ── Quit ──────────────────────────────────────────────────
-            KeyCode::Char('q') => return Ok((true, None)),
-
-            // ── Focus movement ────────────────────────────────────────
-            KeyCode::Char('h') => state.move_focus(area, Dir::Left),
-            KeyCode::Char('l') => state.move_focus(area, Dir::Right),
-            KeyCode::Char('k') => state.move_focus(area, Dir::Up),
-            KeyCode::Char('j') => state.move_focus(area, Dir::Down),
-
-            // ── Split vertical (left / right) ─────────────────────────
-            KeyCode::Char('v') => {
-                let (new_id, reader) = state.do_split(area, SplitKind::Vertical, None)?;
-                return Ok((false, Some((new_id, reader))));
-            }
-
-            // ── Split horizontal (top / bottom) ───────────────────────
-            KeyCode::Char('s') => {
-                let (new_id, reader) = state.do_split(area, SplitKind::Horizontal, None)?;
-                return Ok((false, Some((new_id, reader))));
-            }
-
-            // ── Close focused pane ────────────────────────────────────
-            KeyCode::Char('x') => {
-                let target = state.focus;
-                let should_quit = state.close_pane(target, area)?;
-                return Ok((should_quit, None));
-            }
-
-            // ── Split Explorer ──────────────────────────────────────────────
-           KeyCode::Char('e') => {
-                // Smart split: prefers vertical, but flips to horizontal if cramped
-                let kind = state.smart_split_kind(area, SplitKind::Vertical);
-                state.do_split_explorer(area, kind, tx.clone())?;
-                return Ok((false, None)); // tx handles async data
-            }
-
-            // ── Command Bar Overlay ───────────────────────────────────────
-            KeyCode::Char(' ') => { // Alt + Space
-                state.overlay = Some(AppOverlay {
-                    action: OverlayAction::SpawnCommand,
-                    input: String::new(),
-                });
-                return Ok((false, None));
-            }
-
-            // Ignore other Alt bindings
-            _ => {}
-        }
-    } else {
-        // We defer actions that mutate the layout to avoid borrow checker conflicts
-        // since we are currently holding a mut borrow on state.panes.
-        let mut deferred_action = None;
-
-        if let Some(pane) = state.panes.get_mut(&state.focus) {
-            match pane {
-                AppPane::Terminal(term) => {
-                    dlog(&format!("dispatch_input: forwarding key to pane {}", term.id));
-                    let result = forward_key(key, &mut term.writer);
-                    dlog(&format!("dispatch_input: forward_key result: {result:?}"));
-                    result?;
-                }
-                AppPane::Explorer(exp) => {
-                    match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            let i = exp.list_state.borrow().selected().unwrap_or(0);
-                            if i < exp.entries.len().saturating_sub(1) { exp.list_state.borrow_mut().select(Some(i + 1)); }
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            let i = exp.list_state.borrow().selected().unwrap_or(0);
-                            if i > 0 { exp.list_state.borrow_mut().select(Some(i - 1)); }
-                        }
-                        KeyCode::Char('D') => { // shift + 'd' to delete
-                            if let Some(i) = exp.list_state.borrow().selected() {
-                                if let Some(entry) = exp.entries.get(i) {
-                                    if entry.name != ".." {
-                                        let mut path = exp.cwd.clone();
-                                        path.push(&entry.name);
-                                        deferred_action = Some(("delete", path));
-                                    }
-                                }
-                            }
-                        }
-                        KeyCode::Char('c') => { // 'c' to create
-                            state.overlay = Some(AppOverlay {
-                                action: OverlayAction::CreateFile { cwd: exp.cwd.clone() },
-                                input: String::new(),
-                            });
-                        }
-                        KeyCode::Enter => {
-                            if let Some(i) = exp.list_state.borrow().selected() {
-                                if let Some(entry) = exp.entries.get(i) {
-                                    let mut path = exp.cwd.clone();
-                                    if entry.name == ".." {
-                                        path.pop();
-                                        spawn_dir_read(exp.id, path, tx.clone());
-                                    } else {
-                                        path.push(&entry.name);
-                                        if entry.is_dir {
-                                            spawn_dir_read(exp.id, path, tx.clone());
-                                        } else {
-                                            // It's a file, trigger nvim open
-                                            deferred_action = Some(("open", path));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            dlog(&format!("dispatch_input: explorer pane swallowed key {:?} (not a handled binding)", key.code));
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some((action, path)) = deferred_action {
-            if action == "open" {
-                let mut cmd = CommandBuilder::new("nvim");
-                cmd.arg(path.to_string_lossy().as_ref());
-                cmd.env("TERM", "xterm-256color");
-
-                // Split vertically and open nvim
-                let (new_id, reader) = state.do_split(area, SplitKind::Vertical, Some(cmd))?;
-                return Ok((false, Some((new_id, reader))));
-
-            } else if action == "delete" {
-                if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&path);
-                } else {
-                    let _ = std::fs::remove_file(&path);
-                }
-
-                // Refresh the current explorer pane
-                if let Some(AppPane::Explorer(exp)) = state.panes.get(&state.focus) {
-                    spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
-                }
-            }
-        }
-    }
-    Ok((false, None))
-}
+// key_to_bytes, forward_key, and dispatch_input live in input.rs and
+// dispatch_input is imported above.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 15  Rendering
@@ -968,8 +596,6 @@ mod theme {
     pub const TITLE_BADGE_BG:  Color = Color::Cyan;
     pub const KEY_HINT:        Color = Color::Yellow;
     pub const DIM_TEXT:        Color = Color::DarkGray;
-    pub const PREFIX_FG:       Color = Color::Black;
-    pub const PREFIX_BG:       Color = Color::Yellow;
 }
 
 fn draw(
