@@ -15,7 +15,8 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use tokio::sync::mpsc;
 
 use crate::layout::PaneId;
-use crate::{dlog, AppEvent};
+use crate::app::AppEvent;
+use crate::dlog;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 1  Type alias

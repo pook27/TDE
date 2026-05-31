@@ -12,7 +12,7 @@ use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
 use crate::layout::PaneId;
-use crate::AppEvent;
+use crate::app::AppEvent;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 1  Directory entry

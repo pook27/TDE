@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 
 use crate::layout::{Dir, PaneId, SplitKind};
 use crate::vfs::spawn_dir_read;
-use crate::{AppEvent, AppOverlay, AppPane, AppState, OverlayAction, dlog};
+use crate::app::{AppEvent, AppOverlay, AppPane, AppState, OverlayAction};
+use crate::dlog;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // § 1  Key → PTY byte translation
@@ -286,7 +287,7 @@ pub fn dispatch_input(
         if let Some((action, path)) = deferred_action {
             if action == "open" {
                 let mut cmd = CommandBuilder::new("nvim");
-                cmd.arg(path.to_string_lossy().as_ref());
+                cmd.arg(path.as_os_str());
                 cmd.env("TERM", "xterm-256color");
 
                 let (new_id, reader) = state.do_split(area, SplitKind::Vertical, Some(cmd))?;
