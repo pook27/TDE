@@ -164,11 +164,10 @@ pub fn dispatch_input(
             KeyCode::Char('q') => return Ok((true, None)),
 
             // ── Focus movement ────────────────────────────────────────────
-            KeyCode::Char('h') => state.move_focus(area, Dir::Left),
-            KeyCode::Char('l') => state.move_focus(area, Dir::Right),
-            KeyCode::Char('k') => state.move_focus(area, Dir::Up),
-            KeyCode::Char('j') => state.move_focus(area, Dir::Down),
-
+            KeyCode::Left => state.move_focus(area, Dir::Left),
+            KeyCode::Right => state.move_focus(area, Dir::Right),
+            KeyCode::Up => state.move_focus(area, Dir::Up),
+            KeyCode::Down => state.move_focus(area, Dir::Down),
             // ── Split vertical (left / right) ──────────────────────────────
             KeyCode::Char('v') => {
                 let (new_id, reader) = state.do_split(area, SplitKind::Vertical, None)?;
@@ -224,13 +223,13 @@ pub fn dispatch_input(
                 }
                 AppPane::Explorer(exp) => {
                     match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
+                        KeyCode::Down => {
                             let i = exp.list_state.borrow().selected().unwrap_or(0);
                             if i < exp.entries.len().saturating_sub(1) {
                                 exp.list_state.borrow_mut().select(Some(i + 1));
                             }
                         }
-                        KeyCode::Char('k') | KeyCode::Up => {
+                        KeyCode::Up => {
                             let i = exp.list_state.borrow().selected().unwrap_or(0);
                             if i > 0 {
                                 exp.list_state.borrow_mut().select(Some(i - 1));

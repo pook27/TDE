@@ -498,7 +498,7 @@ pub fn draw(
             Span::styled("split │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+X ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("close │", Style::default().fg(theme::DIM_TEXT)),
-            Span::styled(" Alt+H/J/K/L ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+            Span::styled(" Alt+Arrow Keys ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("focus │", Style::default().fg(theme::DIM_TEXT)),
             Span::styled(" Alt+Q ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
             Span::styled("quit", Style::default().fg(theme::DIM_TEXT)),

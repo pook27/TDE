@@ -1,6 +1,6 @@
-# TDE — Terminal Desktop Environment
+# TDE - Terminal Desktop Environment
 
-A keyboard-centric, tiling TUI desktop environment for headless/SSH machines, built in Rust with `ratatui` + `crossterm` + `portable-pty` + `vt100`.
+A keyboard-centric, tiling TUI desktop environment for headless/SSH machines, built in Rust with `ratatui`, `crossterm`, `portable-pty`, and `vt100`.
 
 ---
 
@@ -22,9 +22,9 @@ cargo run
 
 ---
 
-## Key Bindings (Alt Modifiers)
+## Input & Navigation
 
-TDE uses direct `Alt` (Meta) keybindings for zero-latency, stateless navigation, bypassing the need for a tmux-style prefix key.
+TDE uses direct `Alt` (Meta) keybindings for zero-latency, stateless navigation, alongside spatial mouse support (even over SSH).
 
 ### Global Shortcuts
 
@@ -35,7 +35,7 @@ TDE uses direct `Alt` (Meta) keybindings for zero-latency, stateless navigation,
 | `Alt+V` | Vertical Split (side-by-side) |
 | `Alt+S` | Horizontal Split (top-and-bottom) |
 | `Alt+X` | Close focused pane |
-| `Alt+H/J/K/L` | Move focus (Left/Down/Up/Right) using centroid math |
+| `Alt+H/J/K/L` | Move focus (Left/Down/Up/Right) |
 | `Alt+Q` | Quit TDE |
 
 ### Explorer Shortcuts (When focused on File Explorer)
@@ -47,38 +47,34 @@ TDE uses direct `Alt` (Meta) keybindings for zero-latency, stateless navigation,
 | `c` | Create new file (add `/` to end for directory) |
 | `Shift+D` | Delete file/directory |
 
-All other keystrokes are forwarded verbatim to the active child shell or application.
+### Mouse Support
+
+| Action | Result |
+| --- | --- |
+| `Left Click` | Hit-tests the layout tree and instantly shifts focus to the clicked pane |
+| `Scroll Wheel` | Navigates up/down through lists (e.g., within the File Explorer) |
+
+All other keystrokes are forwarded verbatim to the active child shell or application. Bracketed Paste is fully supported for instantaneous, single-frame block pasting over SSH.
 
 ---
 
 ## Architecture
 
-TDE separates layout structure from pane data to satisfy Rust's strict borrowing rules, and uses an asynchronous MPSC event loop to prevent PTY I/O from blocking the UI thread.
+TDE is heavily optimized for zero-allocation render loops and low-latency network constraints via event batching and channel draining. The codebase is strictly modularized by domain:
 
-```text
-AppState
- ├─ layout:  LayoutNode (Binary Tree: SplitHorizontal, SplitVertical, Pane(id))
- ├─ panes:   HashMap<PaneId, AppPane> (O(1) data access for Terminals & Explorers)
- ├─ focus:   PaneId (Active pane tracking)
- └─ overlay: Option<AppOverlay> (Floating command bar/text input)
-
-run_event_loop()
- ├─ AppEvent::PtyOutput      → parser.process()  → draw()
- ├─ AppEvent::PtyExited      → close_pane()      → draw()
- ├─ AppEvent::ExplorerUpdate → update_vfs()      → draw()
- └─ AppEvent::Input          → dispatch_input()  → draw()
-      ├─ Overlay Active  → capture text / execute command
-      ├─ Alt pressed     → window management / splits
-      └─ Passthrough     → forward to focused PTY or Explorer
-
-```
+* `src/main.rs` - Application setup, RAII TerminalGuard, and Tokio async entry point.
+* `src/app.rs` - Core `AppState`, `AppEvent` MPSC loop, and the `ratatui` rendering pass.
+* `src/layout.rs` - `LayoutNode` binary tree, zero-allocation closure traversals (`walk_rects`), and geometry math.
+* `src/pty.rs` - `TerminalPane` data model, child process/shell lifecycle, and background PTY reader threads.
+* `src/input.rs` - Keystroke routing (`dispatch_input`) and VT100 byte translation.
+* `src/vfs.rs` - `ExplorerPane` data model and asynchronous directory reading tasks.
 
 ## Dependency Notes
 
 | Crate | Role |
 | --- | --- |
 | `ratatui` | TUI framework (layout, widgets, rendering) |
-| `crossterm` | Cross-platform terminal I/O, raw mode, events |
+| `crossterm` | Cross-platform terminal I/O, raw mode, mouse events |
 | `portable-pty` | PTY pair creation, shell spawning |
 | `vt100` | VT100/ANSI escape sequence parser → virtual screen |
 | `tui-term` | Renders a `vt100::Screen` as a ratatui `Widget` |
@@ -90,14 +86,13 @@ run_event_loop()
 
 `TerminalGuard` is a zero-size RAII wrapper that implements `Drop`.
 
-Because `Drop` runs on panics, early returns, and normal exits alike, the SSH session is always restored to a sane state — no more broken terminals after a crash. Child processes (like `nvim` or `bash`) are sent graceful exit sequences (`:qa!`) and then forcefully killed on drop to prevent thread deadlocks and zombie processes.
+Because `Drop` runs on panics, early returns, and normal exits alike, the SSH session is always restored to a sane state - preventing cooked/broken terminals after a crash. Child processes (like `nvim` or `bash`) are sent graceful exit sequences (`:qa!`) and then forcefully killed on drop to prevent thread deadlocks and zombie processes.
 
 ---
 
 ## Future Roadmap
 
-* [ ] **Phase 5: Visual Desktop Compositor** — Swap the tiling tree for a floating layout engine with Z-indexing and mouse click routing.
-* [ ] **GUI Start Menu** — Integrate the Command Bar into an interactive taskbar widget.
-* [ ] **Tab / Workspace Support** — Multiple virtual desktops.
-* [ ] **Dolphin-style Grid Explorer** — Upgrade the VFS list to a spatial icon grid.
-
+* [ ] **Phase 5: Visual Desktop Compositor** - Add alongside the tiling tree, a new modern-looking floating layout engine with Z-indexing.
+* [ ] **GUI Start Menu** - Integrate the Command Bar into an interactive taskbar / start menu esque widget.
+* [ ] **Tab / Workspace Support** - Multiple virtual desktops.
+* [ ] **Dolphin-style Grid Explorer** - Upgrade the VFS list to a spatial icon grid.
