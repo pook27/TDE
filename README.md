@@ -19,24 +19,6 @@ Or run in development mode:
 cargo run
 
 ```
----
-
-## Architecture
-
-src/
-├── main.rs                 # Setup, RAII Guard, Entry point
-├── app.rs                  # AppState, Event Loop, Channel draining
-├── pty.rs                  # TerminalPane, PTY spawning, Child process lifecycle
-├── layout.rs               # LayoutNode tree, Splitting, Pruning, Geometry math
-├── input.rs                # dispatch_input, Keybinds
-├── vfs.rs                  # ExplorerPane, background async file reading
-└── gui/                    # GUI Subsystem
-    ├── mod.rs              # Exposes compositor and mouse modules
-    ├── compositor.rs       # Z-index sorting, Clear widgets
-    └── mouse.rs            # Hit-testing, click routing
-
----
-
 ## Input & Navigation
 
 TDE uses direct `Alt` (Meta) keybindings for zero-latency, stateless navigation, alongside spatial mouse support (even over SSH).

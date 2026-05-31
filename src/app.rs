@@ -116,6 +116,13 @@ pub struct AppState {
     /// Kept in sync with `AppState::panes`: entries are removed in
     /// `close_pane` when their backing pane is destroyed.
     pub floating_windows: Vec<FloatingWindow>,
+    /// Active drag state: `Some((pane_id, last_mouse_x, last_mouse_y))`.
+    ///
+    /// Set on `MouseDown::Left` when a GUI window is clicked, cleared on
+    /// `MouseUp::Left`.  During a `MouseDrag::Left` event the delta between
+    /// the stored last position and the new position is applied to the
+    /// window's `area` origin.
+    pub drag_state:       Option<(PaneId, u16, u16)>,
 }
 
 impl AppState {
@@ -138,6 +145,7 @@ impl AppState {
                 overlay:          None,
                 mode:             DesktopMode::Tiling,
                 floating_windows: Vec::new(),
+                drag_state:       None,
             },
             reader,
         ))
@@ -452,20 +460,39 @@ impl AppState {
 
             DesktopMode::Gui => {
                 // Hit-test the window stack top-to-bottom (reverse iteration).
-                // The topmost window that contains the click wins.
-                let hit = self.floating_windows.iter().rev().find(|w| {
+                // We use `.position()` on the reversed iterator so we can also
+                // recover the forward index needed for `remove` + `push`.
+                let rev_idx = self.floating_windows.iter().rev().position(|w| {
                     x >= w.area.x
                         && x < w.area.x + w.area.width
                         && y >= w.area.y
                         && y < w.area.y + w.area.height
                 });
-                if let Some(win) = hit {
-                    let id = win.id;
-                    if id != self.focus {
+
+                if let Some(rev_idx) = rev_idx {
+                    // Convert reversed-iterator index back to forward index.
+                    let idx = self.floating_windows.len() - 1 - rev_idx;
+                    let id  = self.floating_windows[idx].id;
+
+                    let focus_changed = id != self.focus;
+                    // A window not already at the top of the stack needs to be
+                    // raised regardless of whether focus changed.
+                    let needs_raise   = idx != self.floating_windows.len() - 1;
+
+                    if focus_changed {
                         dlog(&format!("click_focus/gui: ({x},{y}) → pane {id}"));
                         self.focus = id;
-                        return true;
                     }
+
+                    if needs_raise {
+                        // Remove from current position and push to the back
+                        // (= top of the compositor stack).
+                        let win = self.floating_windows.remove(idx);
+                        self.floating_windows.push(win);
+                        dlog(&format!("click_focus/gui: raised pane {id} to top (was idx {idx})"));
+                    }
+
+                    return focus_changed || needs_raise;
                 }
                 false
             }
@@ -770,6 +797,194 @@ pub fn draw(
 // § 16  Event loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Process a single `AppEvent`, mutating `state` in-place.
+///
+/// All rendering is decoupled: instead of calling `draw()` directly, this
+/// function sets `*needs_draw = true` whenever the screen should be refreshed.
+/// The caller is responsible for issuing exactly one `draw()` call after
+/// draining all pending events from the channel.
+///
+/// Quit conditions (last pane closed, `Alt+Q`) set `*should_quit = true` and
+/// return immediately so the outer draining loop can break cleanly.
+fn handle_event(
+    state:       &mut AppState,
+    event:       AppEvent,
+    area:        &mut Rect,
+    tx:          &mpsc::Sender<AppEvent>,
+    needs_draw:  &mut bool,
+    should_quit: &mut bool,
+) -> Result<()> {
+    match event {
+        // ── PTY output ────────────────────────────────────────────────────
+        AppEvent::PtyOutput { pane_id, bytes } => {
+            if let Some(AppPane::Terminal(term)) = state.panes.get(&pane_id) {
+                term.parser.lock().expect("parser poisoned").process(&bytes);
+            }
+            *needs_draw = true;
+        }
+
+        AppEvent::ExplorerUpdate { pane_id, path, entries } => {
+            if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&pane_id) {
+                exp.cwd = path;
+                exp.entries = entries;
+                exp.list_state.borrow_mut().select(Some(0));
+            }
+            *needs_draw = true;
+        }
+
+        // ── Shell exited → automatic pane close ───────────────────────────
+        AppEvent::PtyExited { pane_id } => {
+            dlog(&format!("event_loop: PtyExited pane_id={pane_id}"));
+            let quit = state.close_pane(pane_id, *area)?;
+            dlog(&format!(
+                "event_loop: after close_pane should_quit={quit} remaining_panes={}",
+                state.panes.len()
+            ));
+            if quit {
+                *should_quit = true;
+                return Ok(());
+            }
+            *needs_draw = true;
+        }
+
+        // ── Input events ──────────────────────────────────────────────────
+        AppEvent::Input(ev) => match ev {
+
+            // Fast-path for pasted text (prevents rendering 300 frames
+            // for 300 characters — now also benefits from channel draining)
+            Event::Paste(text) => {
+                if let Some(AppPane::Terminal(term)) = state.panes.get_mut(&state.focus) {
+                    let _ = term.writer.write_all(text.as_bytes());
+                    let _ = term.writer.flush();
+                }
+                *needs_draw = true;
+            }
+
+            Event::Key(key_ev) => {
+                let (quit, new_pane) = dispatch_input(state, *area, key_ev, tx)?;
+
+                if quit {
+                    *should_quit = true;
+                    return Ok(());
+                }
+
+                if let Some((new_id, reader)) = new_pane {
+                    spawn_pane_reader(new_id, reader, tx.clone());
+                }
+
+                *needs_draw = true;
+            }
+
+            Event::Resize(new_cols, new_rows) => {
+                *area = Rect {
+                    x:      0,
+                    y:      1,
+                    width:  new_cols,
+                    height: new_rows.saturating_sub(2),
+                };
+                state.resize_all(*area)?;
+                *needs_draw = true;
+            }
+
+            Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => {}
+
+            // ── Left-click: spatial focus + drag initiation ───────────────
+            Event::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) =>
+            {
+                let changed = state.click_focus(*area, m.column, m.row);
+
+                // In GUI mode, arm the drag state so subsequent Drag events
+                // know which window to move and where the pointer started.
+                if state.mode == DesktopMode::Gui {
+                    // Only arm dragging when a window is actually focused.
+                    if !state.floating_windows.is_empty() {
+                        state.drag_state = Some((state.focus, m.column, m.row));
+                    }
+                }
+
+                if changed {
+                    *needs_draw = true;
+                }
+            }
+
+            // ── Drag: move the focused floating window ────────────────────
+            Event::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)) =>
+            {
+                if let Some((id, last_x, last_y)) = state.drag_state {
+                    let dx = m.column as i32 - last_x as i32;
+                    let dy = m.row    as i32 - last_y as i32;
+
+                    if let Some(win) = state.floating_windows.iter_mut().find(|w| w.id == id) {
+                        // Compute the candidate new origin.
+                        let new_x = win.area.x as i32 + dx;
+                        let new_y = win.area.y as i32 + dy;
+
+                        // Clamp so the window can never be dragged fully
+                        // off-screen.  The right/bottom edges are clamped so
+                        // the window's trailing edge stays within `area`.
+                        // Using `saturating_sub` on the limit avoids wrapping
+                        // when the window is wider/taller than the screen.
+                        let max_x = area.width.saturating_sub(win.area.width) as i32;
+                        let max_y = area.height.saturating_sub(win.area.height) as i32;
+
+                        win.area.x = new_x.max(0).min(max_x) as u16;
+                        win.area.y = new_y.max(0).min(max_y) as u16;
+                    }
+
+                    // Advance the anchor so the next drag event computes a
+                    // delta relative to the *current* pointer position.
+                    state.drag_state = Some((id, m.column, m.row));
+
+                    *needs_draw = true;
+                }
+            }
+
+            // ── Mouse-up: release drag ────────────────────────────────────
+            Event::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) =>
+            {
+                state.drag_state = None;
+                // No redraw needed: final window position was already painted
+                // by the last Drag frame.
+            }
+
+            // ── Scroll wheel: Explorer navigation ────────────────────────
+            Event::Mouse(m)
+                if matches!(
+                    m.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                let focused_id = state.focus;
+                if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&focused_id) {
+                    let i = exp.list_state.borrow().selected().unwrap_or(0);
+                    match m.kind {
+                        MouseEventKind::ScrollUp => {
+                            if i > 0 {
+                                exp.list_state.borrow_mut().select(Some(i - 1));
+                                *needs_draw = true;
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if i < exp.entries.len().saturating_sub(1) {
+                                exp.list_state.borrow_mut().select(Some(i + 1));
+                                *needs_draw = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            Event::Mouse(_) => {}
+            _ => {}
+        },
+    }
+    Ok(())
+}
+
 pub async fn run_event_loop(
     terminal:     &mut Terminal<CrosstermBackend<io::Stdout>>,
     state:        &mut AppState,
@@ -781,7 +996,8 @@ pub async fn run_event_loop(
     draw(terminal, state)?;
 
     loop {
-        let event = tokio::select! {
+        // ── Block until the next event (or the heartbeat tick) ────────────
+        let first_event = tokio::select! {
             ev = rx.recv() => match ev {
                 Some(e) => e,
                 None    => break,
@@ -789,119 +1005,29 @@ pub async fn run_event_loop(
             _ = tokio::time::sleep(Duration::from_millis(500)) => continue,
         };
 
-        match event {
-            // ── PTY output ────────────────────────────────────────────────
-            AppEvent::PtyOutput { pane_id, bytes } => {
-                if let Some(AppPane::Terminal(term)) = state.panes.get(&pane_id) {
-                    term.parser.lock().expect("parser poisoned").process(&bytes);
-                }
-                draw(terminal, state)?;
-            }
+        let mut needs_draw  = false;
+        let mut should_quit = false;
 
-            AppEvent::ExplorerUpdate { pane_id, path, entries } => {
-                if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&pane_id) {
-                    exp.cwd = path;
-                    exp.entries = entries;
-                    exp.list_state.borrow_mut().select(Some(0));
-                }
-                draw(terminal, state)?;
-            }
+        // Process the first (blocking) event.
+        handle_event(state, first_event, &mut area, tx, &mut needs_draw, &mut should_quit)?;
 
-            // ── Shell exited → automatic pane close ───────────────────────
-            AppEvent::PtyExited { pane_id } => {
-                dlog(&format!("event_loop: PtyExited pane_id={pane_id}"));
-                let should_quit = state.close_pane(pane_id, area)?;
-                dlog(&format!(
-                    "event_loop: after close_pane should_quit={should_quit} remaining_panes={}",
-                    state.panes.len()
-                ));
-                if should_quit {
-                    break;
-                }
-                draw(terminal, state)?;
-            }
-
-            // ── Input events ──────────────────────────────────────────────
-            AppEvent::Input(ev) => match ev {
-
-                // Fast-path for pasted text (prevents rendering 300 frames for 300 characters)
-                Event::Paste(text) => {
-                    if let Some(AppPane::Terminal(term)) = state.panes.get_mut(&state.focus) {
-                        let _ = term.writer.write_all(text.as_bytes());
-                        let _ = term.writer.flush();
-                    }
-                    draw(terminal, state)?;
-                }
-
-                Event::Key(key_ev) => {
-                    let (should_quit, new_pane) =
-                        dispatch_input(state, area, key_ev, tx)?;
-
-                    if should_quit {
-                        break;
-                    }
-
-                    if let Some((new_id, reader)) = new_pane {
-                        spawn_pane_reader(new_id, reader, tx.clone());
-                    }
-
-                    draw(terminal, state)?;
-                }
-
-                Event::Resize(new_cols, new_rows) => {
-                    area = Rect {
-                        x:      0,
-                        y:      1,
-                        width:  new_cols,
-                        height: new_rows.saturating_sub(2),
-                    };
-                    state.resize_all(area)?;
-                    draw(terminal, state)?;
-                }
-
-                Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => {}
-
-                // ── Left-click: spatial focus ──────────────────────────────
-                Event::Mouse(m)
-                    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) =>
-                {
-                    if state.click_focus(area, m.column, m.row) {
-                        draw(terminal, state)?;
-                    }
-                }
-
-                // ── Scroll wheel: Explorer navigation ─────────────────────
-                Event::Mouse(m)
-                    if matches!(
-                        m.kind,
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                    ) =>
-                {
-                    let focused_id = state.focus;
-                    if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&focused_id) {
-                        let i = exp.list_state.borrow().selected().unwrap_or(0);
-                        match m.kind {
-                            MouseEventKind::ScrollUp => {
-                                if i > 0 {
-                                    exp.list_state.borrow_mut().select(Some(i - 1));
-                                    draw(terminal, state)?;
-                                }
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if i < exp.entries.len().saturating_sub(1) {
-                                    exp.list_state.borrow_mut().select(Some(i + 1));
-                                    draw(terminal, state)?;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                Event::Mouse(_) => {}
-                _ => {}
-            },
+        // ── Channel draining ──────────────────────────────────────────────
+        //
+        // Consume every event already sitting in the channel before we
+        // render.  This collapses arbitrarily long bursts of `PtyOutput`
+        // frames and `MouseDrag` ticks into a single draw call, eliminating
+        // the latency that appears when rendering can't keep pace with the
+        // producer (PTY reader thread, mouse at 1kHz, paste floods, etc.).
+        //
+        // `try_recv` is non-blocking: it returns `Err(Empty)` the instant the
+        // queue is empty, so we never stall waiting for a future event.
+        while let Ok(next_ev) = rx.try_recv() {
+            if should_quit { break; }
+            handle_event(state, next_ev, &mut area, tx, &mut needs_draw, &mut should_quit)?;
         }
+
+        if should_quit { break; }
+        if needs_draw  { draw(terminal, state)?; }
     }
     Ok(())
 }
