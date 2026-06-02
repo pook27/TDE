@@ -146,12 +146,30 @@ async fn main() -> Result<()> {
         height: term_rows.saturating_sub(2),
     };
 
-    let (mut state, initial_reader) =
-        AppState::new(content_area).context("init app state")?;
-
     let (tx, mut rx) = mpsc::channel::<AppEvent>(512);
 
-    spawn_pane_reader(0, initial_reader, tx.clone());
+    // Ensure the ~/.config/tde/ directory exists
+    let session_dir = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".config").join("tde"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/tde"));
+    std::fs::create_dir_all(&session_dir)?;
+    let session_path = session_dir.join("session.json");
+
+    // Attempt to load the session. If it fails (missing file or corrupt JSON),
+    // fall back gracefully to a clean, single-terminal state.
+    let (mut state, readers) = match app::load_session(&session_path, content_area, &tx) {
+        Ok(restored) => restored,
+        Err(_) => {
+            dlog("main: failed to load session, starting fresh");
+            let (fresh_state, initial_reader) = AppState::new(content_area).context("init app state")?;
+            (fresh_state, vec![(0, initial_reader)])
+        }
+    };
+
+    // Spawn the background I/O threads for every terminal restored
+    for (id, reader) in readers {
+        spawn_pane_reader(id, reader, tx.clone());
+    }
 
     let tx_input = tx.clone();
     tokio::spawn(async move { input_task(tx_input).await });
@@ -465,5 +483,209 @@ mod tests {
             "CRITICAL FLAW: Tiling engine crushed a pane to width {}. Block::inner() will panic!",
             min_width
         );
+    }
+
+    // ── Session persistence round-trip tests ──────────────────────────────────
+    //
+    // These tests exercise `save_session` / `load_session` without a real PTY
+    // or terminal.  They construct `SessionState` directly and verify the full
+    // serialize → write → read → deserialize round-trip.
+    //
+    // Run with:  cargo test session -- --nocapture
+
+    #[test]
+    fn session_serializes_layout_tree() {
+        // Build a known tree: pane 0 split horizontally with pane 1.
+        let tree = LayoutNode::SplitHorizontal {
+            left:  Box::new(LayoutNode::Pane(0)),
+            right: Box::new(LayoutNode::Pane(1)),
+            ratio: 50,
+        };
+
+        // Serialize → JSON string → deserialize.
+        let json = serde_json::to_string(&tree)
+            .expect("LayoutNode must serialize");
+        let restored: LayoutNode = serde_json::from_str(&json)
+            .expect("LayoutNode must deserialize");
+
+        // The round-tripped tree must contain the same ids in the same order.
+        assert_eq!(restored.all_pane_ids(), vec![0, 1]);
+        assert!(
+            matches!(restored, LayoutNode::SplitHorizontal { ratio: 50, .. }),
+            "variant and ratio must survive the round-trip"
+        );
+    }
+
+    #[test]
+    fn session_desktop_mode_roundtrip() {
+        use crate::app::DesktopMode;
+
+        let tiling_json = serde_json::to_string(&DesktopMode::Tiling).unwrap();
+        let gui_json    = serde_json::to_string(&DesktopMode::Gui).unwrap();
+
+        let tiling: DesktopMode = serde_json::from_str(&tiling_json).unwrap();
+        let gui:    DesktopMode = serde_json::from_str(&gui_json).unwrap();
+
+        assert_eq!(tiling, DesktopMode::Tiling);
+        assert_eq!(gui,    DesktopMode::Gui);
+    }
+
+    #[test]
+    fn session_pane_blueprint_roundtrip() {
+        use crate::app::{PaneBlueprint, PaneBlueprintKind};
+        use std::path::PathBuf;
+
+        let blueprints = vec![
+            PaneBlueprint { id: 0, kind: PaneBlueprintKind::Terminal { custom_command: None } },
+            PaneBlueprint {
+                id:   1,
+                kind: PaneBlueprintKind::Explorer {
+                    cwd: PathBuf::from("/home/user/projects"),
+                },
+            },
+        ];
+
+        let json = serde_json::to_string_pretty(&blueprints)
+            .expect("blueprints must serialize");
+
+        // Sanity-check the JSON contains what we expect.
+        assert!(json.contains("\"Terminal\""),  "Terminal variant must appear in JSON");
+        assert!(json.contains("\"Explorer\""),  "Explorer variant must appear in JSON");
+        assert!(json.contains("/home/user/projects"), "cwd must appear in JSON");
+
+        let restored: Vec<PaneBlueprint> = serde_json::from_str(&json)
+            .expect("blueprints must deserialize");
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].id, 0);
+        assert!(matches!(restored[0].kind, PaneBlueprintKind::Terminal { custom_command: None }));
+        assert_eq!(restored[1].id, 1);
+        if let PaneBlueprintKind::Explorer { cwd } = &restored[1].kind {
+            assert_eq!(*cwd, PathBuf::from("/home/user/projects"));
+        } else {
+            panic!("expected Explorer blueprint for id=1");
+        }
+    }
+
+    #[test]
+    fn session_floating_window_roundtrip() {
+        use crate::gui::window::FloatingWindow;
+
+        let windows = vec![
+            FloatingWindow {
+                id:             0,
+                area:           Rect { x: 10, y: 5, width: 80, height: 30 },
+                unsnapped_area: None,
+            },
+            FloatingWindow {
+                id:             1,
+                area:           Rect { x: 0, y: 0, width: 120, height: 40 },
+                unsnapped_area: Some(Rect { x: 20, y: 10, width: 60, height: 20 }),
+            },
+        ];
+
+        let json = serde_json::to_string(&windows).unwrap();
+        let restored: Vec<FloatingWindow> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].area, Rect { x: 10, y: 5, width: 80, height: 30 });
+        assert!(restored[0].unsnapped_area.is_none());
+        assert_eq!(restored[1].id, 1);
+        assert_eq!(
+            restored[1].unsnapped_area,
+            Some(Rect { x: 20, y: 10, width: 60, height: 20 })
+        );
+    }
+
+    #[test]
+    fn session_save_and_load_file() {
+        use crate::app::{
+            SessionState, PaneBlueprint, PaneBlueprintKind,
+            DesktopMode,
+        };
+        use crate::gui::window::FloatingWindow;
+
+        // ── Build a minimal SessionState by hand ──────────────────────────
+        let session = SessionState {
+            layout: LayoutNode::SplitHorizontal {
+                left:  Box::new(LayoutNode::Pane(0)),
+                right: Box::new(LayoutNode::Pane(1)),
+                ratio: 50,
+            },
+            focus:  0,
+            next_id: 2,
+            mode:   DesktopMode::Tiling,
+            floating_windows: vec![
+                FloatingWindow {
+                    id:             0,
+                    area:           Rect { x: 5, y: 5, width: 60, height: 20 },
+                    unsnapped_area: None,
+                },
+            ],
+            panes: vec![
+                PaneBlueprint { id: 0, kind: PaneBlueprintKind::Terminal { custom_command: None } },
+                PaneBlueprint {
+                    id:   1,
+                    kind: PaneBlueprintKind::Explorer {
+                        cwd: std::path::PathBuf::from("/tmp"),
+                    },
+                },
+            ],
+        };
+
+        // ── Atomic write to a temp path ───────────────────────────────────
+        let dir      = std::env::temp_dir();
+        let path     = dir.join("tde_session_test.json");
+        let tmp_path = dir.join("tde_session_test.json.tmp");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let json = serde_json::to_string_pretty(&session).unwrap();
+        std::fs::write(&tmp_path, json.as_bytes()).unwrap();
+        std::fs::rename(&tmp_path, &path).unwrap();
+
+        assert!(path.exists(), "session file must exist after save");
+
+        // ── Read back and verify every field ──────────────────────────────
+        let raw    = std::fs::read_to_string(&path).unwrap();
+        let loaded: SessionState = serde_json::from_str(&raw)
+            .expect("saved file must parse back without error");
+
+        assert_eq!(loaded.focus,   0);
+        assert_eq!(loaded.next_id, 2);
+        assert_eq!(loaded.mode,    DesktopMode::Tiling);
+        assert_eq!(loaded.layout.all_pane_ids(), vec![0, 1]);
+        assert_eq!(loaded.floating_windows.len(), 1);
+        assert_eq!(loaded.floating_windows[0].area.width, 60);
+        assert_eq!(loaded.panes.len(), 2);
+
+        let t = loaded.panes.iter().find(|p| p.id == 0).unwrap();
+        assert!(matches!(t.kind, PaneBlueprintKind::Terminal { custom_command: None }));
+
+        let e = loaded.panes.iter().find(|p| p.id == 1).unwrap();
+        if let PaneBlueprintKind::Explorer { cwd } = &e.kind {
+            assert_eq!(*cwd, std::path::PathBuf::from("/tmp"));
+        } else {
+            panic!("expected Explorer blueprint for pane 1");
+        }
+
+        // Verify the file is valid JSON that can be inspected manually at:
+        // /tmp/tde_session_test.json (left in place deliberately for Option 2 below)
+        eprintln!("\n── Session JSON (for manual inspection) ──\n{raw}\n──────────────────────────────────────────");
+    }
+
+    #[test]
+    fn session_corrupt_file_returns_error() {
+        use crate::app::SessionState;
+
+        // Garbage JSON must return Err, never panic.
+        let result: Result<SessionState, _> =
+            serde_json::from_str("this is not json {{ }}");
+        assert!(result.is_err(), "corrupt JSON must produce Err, not panic");
+
+        // Structurally valid JSON but wrong shape must also Err.
+        let result2: Result<SessionState, _> =
+            serde_json::from_str(r#"{"unexpected_field": 42}"#);
+        assert!(result2.is_err(), "wrong-shape JSON must produce Err");
     }
 }

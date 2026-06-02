@@ -24,7 +24,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use tui_term::widget::PseudoTerminal;
 
@@ -178,29 +178,7 @@ pub fn render_pane_content(frame: &mut Frame, pane: &AppPane, inner_area: Rect) 
         }
 
         AppPane::Explorer(exp) => {
-            let items: Vec<ListItem> = exp.entries.iter().map(|e| {
-                let icon  = if e.is_dir { "📁" } else { "📄" };
-                let style = if e.is_dir {
-                    Style::default().fg(Color::Blue)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(format!(" {} {}", icon, e.name)).style(style)
-            }).collect();
-
-            let list = List::new(items)
-                .highlight_style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol(">> ");
-
-            frame.render_stateful_widget(
-                list,
-                inner_area,
-                &mut *exp.list_state.borrow_mut(),
-            );
+            crate::app::render_explorer_grid(frame, exp, inner_area);
         }
     }
 }

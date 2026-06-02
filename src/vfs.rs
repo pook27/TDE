@@ -6,9 +6,12 @@
 //! `crate::AppEvent`, which carries `ExplorerUpdate` results back to the event
 //! loop via the `mpsc` channel.
 
-use std::{cell::RefCell, path::PathBuf};
+use std::{
+    cell::RefCell,
+    path::PathBuf,
+    time::Instant,
+};
 
-use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 
 use crate::layout::PaneId;
@@ -32,22 +35,20 @@ pub struct ExplorerPane {
     pub id:      PaneId,
     pub cwd:     PathBuf,
     pub entries: Vec<ExplorerEntry>,
-    /// `RefCell` lets `draw()` (which takes `&AppState`) call
-    /// `render_stateful_widget` without cloning the selection state.
-    /// Interior mutability is safe here: `draw()` is always called from the
-    /// single-threaded event loop, never concurrently with input handlers.
-    pub list_state: RefCell<ListState>,
+    pub selected_index: RefCell<usize>,
+    pub scroll_offset:  RefCell<usize>,
+    pub last_click: RefCell<Option<(usize, Instant)>>,
 }
 
 impl ExplorerPane {
     pub fn new(id: PaneId, path: PathBuf) -> Self {
-        let mut ls = ListState::default();
-        ls.select(Some(0));
         Self {
             id,
             cwd: path,
             entries: Vec::new(),
-            list_state: RefCell::new(ls),
+            selected_index: RefCell::new(0),
+            scroll_offset:  RefCell::new(0),
+            last_click: RefCell::new(None),
         }
     }
 }

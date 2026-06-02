@@ -1,4 +1,4 @@
-//! `gui/window.rs` — The `FloatingWindow` data type.
+//! `gui/w//! `gui/window.rs` — The `FloatingWindow` data type.
 //!
 //! A `FloatingWindow` is a lightweight record that associates a pane (by id)
 //! with an arbitrary on-screen `Rect`.  The rest of the window's appearance —
@@ -21,7 +21,7 @@ use ratatui::layout::Rect;
 ///
 /// Fields are `pub` because the compositor, input handler, and `AppState`
 /// methods all need direct read/write access.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct FloatingWindow {
     /// The pane whose content is rendered inside this window.
     pub id: PaneId,
@@ -29,12 +29,20 @@ pub struct FloatingWindow {
     /// Includes the one-cell border on every side, so the usable inner area
     /// is `area` shrunk by 1 on each edge (use `Block::inner` to compute it).
     pub area: Rect,
+    /// Saved floating geometry from before a snap operation.
+    ///
+    /// `Some(rect)` when the window is currently snapped (left-half, right-half,
+    /// or maximised).  Restored to `win.area` the moment the user begins
+    /// dragging the window away from the snap position, then reset to `None`.
+    /// `None` when the window is in a normal floating position.
+    pub unsnapped_area: Option<Rect>,
 }
 
 impl FloatingWindow {
     /// Construct a `FloatingWindow` directly from its components.
+    /// `unsnapped_area` is initialised to `None` — the window starts floating.
     pub fn new(id: PaneId, area: Rect) -> Self {
-        Self { id, area }
+        Self { id, area, unsnapped_area: None }
     }
 }
 

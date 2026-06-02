@@ -70,23 +70,13 @@ impl ProcNameCache {
 
 pub struct TerminalPane {
     pub id:        PaneId,
-    /// Dropping `_child` sends SIGHUP to the shell and waits — exactly what we
-    /// want when a pane is removed from the HashMap.
     pub _child:    Box<dyn Child + Send + Sync>,
     pub master:    Box<dyn MasterPty + Send>,
     pub writer:    Box<dyn Write + Send>,
     pub parser:    SharedParser,
-    /// `true` if this pane was spawned from a user-typed custom command
-    /// (Alt+Space overlay).  Shell panes created by `do_split(…, None)` are
-    /// `false`.  Used by the `PtyExited` handler to decide whether to retain
-    /// or immediately close the pane.
+    pub custom_command: Option<String>,
     pub is_custom: bool,
-    /// `true` once the child process has exited **and** the pane is a custom
-    /// one (`is_custom == true`).  The renderer draws a red "Process Completed"
-    /// banner and the user dismisses with Alt+X.
     pub is_dead:   bool,
-    /// Per-pane cache for `foreground_process_name()`.  Not `pub` — callers
-    /// must go through the method so the invalidation logic is centralised.
     proc_cache:    ProcNameCache,
 }
 
@@ -95,15 +85,30 @@ impl TerminalPane {
         id: PaneId,
         rows: u16,
         cols: u16,
-        custom_cmd: Option<CommandBuilder>,
+        custom_command: Option<String>,
     ) -> Result<(Self, Box<dyn Read + Send>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("openpty")?;
 
-        let is_custom = custom_cmd.is_some();
-        let cmd       = custom_cmd.unwrap_or_else(shell_cmd);
+        let is_custom = custom_command.is_some();
+        
+        // Parse the raw command string into a CommandBuilder
+        let cmd = if let Some(ref cmd_str) = custom_command {
+            let mut parts = cmd_str.trim().split_whitespace();
+            if let Some(bin) = parts.next() {
+                let mut c = CommandBuilder::new(bin);
+                for arg in parts { c.arg(arg); }
+                c.env("TERM", "xterm-256color");
+                c
+            } else {
+                shell_cmd()
+            }
+        } else {
+            shell_cmd()
+        };
+
         let child     = pair.slave.spawn_command(cmd).context("spawn shell")?;
         let reader    = pair.master.try_clone_reader().context("clone PTY reader")?;
         let writer    = pair.master.take_writer().context("take PTY writer")?;
@@ -116,6 +121,7 @@ impl TerminalPane {
                 master:     pair.master,
                 writer,
                 parser,
+                custom_command,
                 is_custom,
                 is_dead:    false,
                 proc_cache: ProcNameCache::new(),

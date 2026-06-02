@@ -24,7 +24,7 @@ pub type PaneId = u32;
 // § 2  Direction
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub enum Dir {
     Left,
     Right,
@@ -37,7 +37,7 @@ pub enum Dir {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Which axis to split on.
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub enum SplitKind {
     /// `v` key: split left/right → SplitHorizontal; new pane on the right.
     Vertical,
@@ -54,11 +54,21 @@ pub enum SplitKind {
 /// The `Sentinel` variant exists solely as a `mem::replace` placeholder that is
 /// never visible to any other code path — it is always immediately overwritten.
 /// It is not exported and contains no data, so it imposes zero cost.
+///
+/// `Sentinel` is tagged `#[serde(skip)]`-equivalent via the `other` catch-all
+/// so that a stale sentinel in a (hypothetically corrupt) JSON file deserialises
+/// gracefully to `Pane(0)` rather than panicking.  In practice a serialised
+/// `LayoutNode` will never contain `Sentinel` because `save_session` is only
+/// called from a clean exit path where no tree mutation is in progress.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub enum LayoutNode {
     Pane(PaneId),
     SplitHorizontal { left: Box<LayoutNode>, right: Box<LayoutNode>, ratio: u16 },
     SplitVertical   { top:  Box<LayoutNode>, bottom: Box<LayoutNode>, ratio: u16 },
     /// Private placeholder used during tree mutation only.  Must never persist.
+    ///
+    /// Serialises to the JSON tag `"Sentinel"` but `load_session` validates the
+    /// tree before handing it to `AppState`, so this variant is never restored.
     Sentinel,
 }
 

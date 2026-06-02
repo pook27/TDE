@@ -10,13 +10,12 @@ use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use portable_pty::CommandBuilder;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::layout::{Dir, PaneId, SplitKind};
 use crate::vfs::spawn_dir_read;
-use crate::app::{AppEvent, AppOverlay, AppPane, AppState, OverlayAction};
+use crate::app::{AppEvent, AppOverlay, AppPane, AppState, OverlayAction, DesktopMode};
 use crate::dlog;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -117,17 +116,13 @@ pub fn dispatch_input(
                 match overlay.action {
                     OverlayAction::SpawnCommand => {
                         if !overlay.input.trim().is_empty() {
-                            // Basic command parsing (splits by space)
-                            let mut parts = overlay.input.trim().split_whitespace();
-                            let mut cmd = CommandBuilder::new(parts.next().unwrap());
-                            for arg in parts { cmd.arg(arg); }
-                            cmd.env("TERM", "xterm-256color");
+                            let cmd_str = overlay.input.trim().to_string();
 
                             // Smart split: prefers vertical, but flips to horizontal if cramped
                             let kind = state.smart_split_kind(area, SplitKind::Vertical);
                             
                             // Safely unwrap the split if the limiters allowed it
-                            if let Some((new_id, reader)) = state.do_split(area, kind, Some(cmd))? {
+                            if let Some((new_id, reader)) = state.do_split(area, kind, Some(cmd_str))? {
                                 return Ok((false, Some((new_id, reader))));
                             }
                         }
@@ -252,27 +247,34 @@ pub fn dispatch_input(
                     result?;
                 }
                 AppPane::Explorer(exp) => {
+                    // Dynamically calculate columns based on pane width
+                    let mut inner_width = 80;
+                    if state.mode == DesktopMode::Tiling {
+                        state.layout.walk_rects(area, &mut |id, rect| {
+                            if id == state.focus { inner_width = rect.width.saturating_sub(2); }
+                        });
+                    } else {
+                        if let Some(win) = state.floating_windows.iter().find(|w| w.id == state.focus) {
+                            inner_width = win.area.width.saturating_sub(2);
+                        }
+                    }
+                    let cols = (inner_width / 14).max(1) as usize;
+                    let len = exp.entries.len();
+
+                    if len == 0 { return Ok((false, None)); }
+                    let mut i = *exp.selected_index.borrow();
+
                     match key.code {
-                        KeyCode::Down => {
-                            let i = exp.list_state.borrow().selected().unwrap_or(0);
-                            if i < exp.entries.len().saturating_sub(1) {
-                                exp.list_state.borrow_mut().select(Some(i + 1));
-                            }
-                        }
-                        KeyCode::Up => {
-                            let i = exp.list_state.borrow().selected().unwrap_or(0);
-                            if i > 0 {
-                                exp.list_state.borrow_mut().select(Some(i - 1));
-                            }
-                        }
+                        KeyCode::Left  => i = i.saturating_sub(1),
+                        KeyCode::Right => i = (i + 1).min(len.saturating_sub(1)),
+                        KeyCode::Up    => i = i.saturating_sub(cols),
+                        KeyCode::Down  => i = (i + cols).min(len.saturating_sub(1)),
                         KeyCode::Char('D') => { // Shift+D to delete
-                            if let Some(i) = exp.list_state.borrow().selected() {
-                                if let Some(entry) = exp.entries.get(i) {
-                                    if entry.name != ".." {
-                                        let mut path = exp.cwd.clone();
-                                        path.push(&entry.name);
-                                        deferred_action = Some(("delete", path));
-                                    }
+                            if let Some(entry) = exp.entries.get(i) {
+                                if entry.name != ".." {
+                                    let mut path = exp.cwd.clone();
+                                    path.push(&entry.name);
+                                    deferred_action = Some(("delete", path));
                                 }
                             }
                         }
@@ -283,31 +285,24 @@ pub fn dispatch_input(
                             });
                         }
                         KeyCode::Enter => {
-                            if let Some(i) = exp.list_state.borrow().selected() {
-                                if let Some(entry) = exp.entries.get(i) {
-                                    let mut path = exp.cwd.clone();
-                                    if entry.name == ".." {
-                                        path.pop();
+                            if let Some(entry) = exp.entries.get(i) {
+                                let mut path = exp.cwd.clone();
+                                if entry.name == ".." {
+                                    path.pop();
+                                    spawn_dir_read(exp.id, path, tx.clone());
+                                } else {
+                                    path.push(&entry.name);
+                                    if entry.is_dir {
                                         spawn_dir_read(exp.id, path, tx.clone());
                                     } else {
-                                        path.push(&entry.name);
-                                        if entry.is_dir {
-                                            spawn_dir_read(exp.id, path, tx.clone());
-                                        } else {
-                                            // It's a file — open it in nvim
-                                            deferred_action = Some(("open", path));
-                                        }
+                                        deferred_action = Some(("open", path));
                                     }
                                 }
                             }
                         }
-                        _ => {
-                            dlog(&format!(
-                                "dispatch_input: explorer pane swallowed key {:?} (not a handled binding)",
-                                key.code
-                            ));
-                        }
+                        _ => dlog(&format!("explorer pane swallowed key {:?}", key.code)),
                     }
+                    *exp.selected_index.borrow_mut() = i;
                 }
             }
         }
@@ -315,13 +310,11 @@ pub fn dispatch_input(
         // ── 4. Deferred layout mutations ──────────────────────────────────────
         if let Some((action, path)) = deferred_action {
             if action == "open" {
-                let mut cmd = CommandBuilder::new("nvim");
-                cmd.arg(path.as_os_str());
-                cmd.env("TERM", "xterm-256color");
+                let cmd_str = format!("nvim {}", path.display());
 
-                if let Some((new_id, reader)) = state.do_split(area, SplitKind::Vertical, Some(cmd))? {
+                if let Some((new_id, reader)) = state.do_split(area, SplitKind::Vertical, Some(cmd_str))? {
                     return Ok((false, Some((new_id, reader))));
-                } // <--- THIS is the brace that was missing!
+                }
                 
             } else if action == "delete" {
                 if path.is_dir() {

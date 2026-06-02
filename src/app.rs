@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     io::{self, Read, Write},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::layout::{
@@ -33,13 +33,12 @@ use crate::dlog;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, MouseButton, MouseEventKind};
 use futures::StreamExt;
-use portable_pty::CommandBuilder;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect, Alignment},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Terminal,
 };
 use tokio::sync::mpsc;
@@ -67,7 +66,7 @@ pub enum AppEvent {
 /// switching is instantaneous — no re-spawning or state transfer needed.
 ///
 /// `PartialEq` is derived so that `draw()` can branch with `==`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DesktopMode {
     /// Classic tiling layout driven by `LayoutNode::walk_rects`.
     Tiling,
@@ -99,6 +98,185 @@ pub enum OverlayAction {
 pub struct AppOverlay {
     pub action: OverlayAction,
     pub input:  String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 9  Session persistence
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Serialisable description of a single pane.
+///
+/// We cannot serialise live PTY state (`TerminalPane`) or the `RefCell`-heavy
+/// `ExplorerPane` directly.  Instead we capture only the information needed to
+/// *recreate* the pane on the next startup: its id, its kind, and — for
+/// Explorer panes — the directory it was browsing.  Terminal panes are always
+/// restored as a fresh shell.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct PaneBlueprint {
+    pub id:   PaneId,
+    pub kind: PaneBlueprintKind,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub enum PaneBlueprintKind {
+    Terminal { custom_command: Option<String> },
+    Explorer { cwd: PathBuf },
+}
+
+/// The complete on-disk session snapshot.
+///
+/// Serialised as JSON by `save_session` and deserialised by `load_session`.
+/// Every field is `pub` so the caller (typically `main`) can inspect or patch
+/// the struct before handing it to `load_session` if needed.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SessionState {
+    /// The binary tiling tree.  Pane ids inside the tree match those in `panes`.
+    pub layout:           LayoutNode,
+    /// The pane that had keyboard focus when the session was saved.
+    pub focus:            PaneId,
+    /// The next free pane id (monotonically increasing allocator).
+    pub next_id:          PaneId,
+    /// Whether the session was saved in Tiling or Gui desktop mode.
+    pub mode:             DesktopMode,
+    /// The ordered floating-window stack (back → front).
+    /// May be empty when `mode == DesktopMode::Tiling`.
+    pub floating_windows: Vec<FloatingWindow>,
+    /// One blueprint per pane, in arbitrary order.
+    pub panes:            Vec<PaneBlueprint>,
+}
+
+/// Serialize `state` to a `SessionState` and write it atomically to `path`.
+///
+/// ### Atomic write strategy
+///
+/// We write to `<path>.tmp` first, then `rename` over `path`.  On any POSIX
+/// filesystem `rename` is atomic with respect to crashes, so a power-loss
+/// during the write never leaves a truncated session file — the previous
+/// session is either fully present or replaced by the new one.
+///
+/// ### What is NOT saved
+///
+/// * The PTY scroll-back buffer and current screen contents — restored as a
+///   fresh shell instead.
+/// * `AppState::overlay` — transient UI state, always starts closed.
+/// * `AppState::drag_state` — transient UI state, always starts `None`.
+/// * Explorer `selected_index` / `scroll_offset` / `entries` — re-populated
+///   by the background `spawn_dir_read` task at startup.
+pub fn save_session(state: &AppState, path: &std::path::Path) -> Result<()> {
+    // Build the blueprints list by iterating the live pane map.
+    // The map is unordered; order doesn't matter because `load_session`
+    // looks up blueprints by id rather than position.
+    let panes: Vec<PaneBlueprint> = state.panes.iter().map(|(&id, pane)| {
+        let kind = match pane {
+            AppPane::Terminal(term) => PaneBlueprintKind::Terminal { 
+                custom_command: term.custom_command.clone()
+            },
+            AppPane::Explorer(exp) => PaneBlueprintKind::Explorer { cwd: exp.cwd.clone() },
+        };
+        PaneBlueprint { id, kind }
+    }).collect();
+
+    let session = SessionState {
+        layout:           state.layout.clone(),
+        focus:            state.focus,
+        next_id:          state.next_id,
+        mode:             state.mode,
+        floating_windows: state.floating_windows.clone(),
+        panes,
+    };
+
+    // Serialize to JSON.
+    let json = serde_json::to_string_pretty(&session)?;
+
+    // Atomic write: write to a temp file alongside the target, then rename.
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json.as_bytes())?;
+    std::fs::rename(&tmp_path, path)?;
+
+    dlog(&format!("save_session: wrote {} bytes to {}", json.len(), path.display()));
+    Ok(())
+}
+
+/// Deserialise a `SessionState` from `path` and reconstruct a live `AppState`.
+///
+/// Returns `(AppState, Vec<(PaneId, Box<dyn Read + Send>)>)`.  The caller is
+/// responsible for calling `spawn_pane_reader` for every `(id, reader)` pair,
+/// and `spawn_dir_read` for every Explorer pane, before entering the event loop.
+///
+/// ### Fallibility
+///
+/// This function returns `Err` on I/O or JSON parse failures.  The caller
+/// (`main`) should fall back to `AppState::new()` when this returns `Err` so
+/// that a missing or corrupt session file is silently treated as a fresh start.
+///
+/// ### PTY size
+///
+/// `area` is the content `Rect` computed from the initial terminal size.
+/// All panes are sized to fit inside `area`; the layout tree's ratio values
+/// are preserved so the proportions match what was saved.
+pub fn load_session(
+    path:  &std::path::Path,
+    area:  Rect,
+    tx:    &mpsc::Sender<AppEvent>,
+) -> Result<(AppState, Vec<(PaneId, Box<dyn Read + Send>)>)> {
+    let json = std::fs::read_to_string(path)?;
+    let session: SessionState = serde_json::from_str(&json)?;
+
+    dlog(&format!(
+        "load_session: restoring {} pane(s), mode={:?}, focus={}",
+        session.panes.len(), session.mode, session.focus,
+    ));
+
+    let mut panes:   HashMap<PaneId, AppPane> = HashMap::new();
+    let mut readers: Vec<(PaneId, Box<dyn Read + Send>)> = Vec::new();
+
+    // Re-create every pane from its blueprint.
+    // PTY dimensions: derive from `area` using the same formula as
+    // `AppState::new` so the terminal is never created with zero rows/cols.
+    let rows = area.height.saturating_sub(2).max(2);
+    let cols = area.width.saturating_sub(2).max(8);
+
+    for bp in &session.panes {
+        match &bp.kind {
+            PaneBlueprintKind::Terminal { custom_command } => {
+                let (pane, reader) = TerminalPane::new(bp.id, rows, cols, custom_command.clone())?;
+                panes.insert(bp.id, AppPane::Terminal(pane));
+                readers.push((bp.id, reader));
+                dlog(&format!("load_session: spawned terminal pane {}", bp.id));
+            }
+            PaneBlueprintKind::Explorer { cwd } => {
+                let explorer = ExplorerPane::new(bp.id, cwd.clone());
+                panes.insert(bp.id, AppPane::Explorer(explorer));
+                // Kick off the background directory read so entries populate
+                // immediately after the event loop starts.
+                spawn_dir_read(bp.id, cwd.clone(), tx.clone());
+                dlog(&format!("load_session: restored explorer pane {} at {}", bp.id, cwd.display()));
+            }
+        }
+    }
+
+    // Validate: if the session file is corrupt and references pane ids that
+    // weren't restored, fall back to a single-pane default rather than
+    // crashing inside `AppState` methods that assume the layout is consistent.
+    let valid_focus = if panes.contains_key(&session.focus) {
+        session.focus
+    } else {
+        // Pick the numerically smallest id we actually have.
+        panes.keys().copied().min().unwrap_or(0)
+    };
+
+    let state = AppState {
+        layout:           session.layout,
+        panes,
+        focus:            valid_focus,
+        next_id:          session.next_id,
+        overlay:          None,
+        mode:             session.mode,
+        floating_windows: session.floating_windows,
+        drag_state:       None,
+    };
+
+    Ok((state, readers))
 }
 
 pub struct AppState {
@@ -137,17 +315,17 @@ impl AppState {
         panes.insert(id, AppPane::Terminal(pane));
 
         Ok((
-            Self {
-                layout:           LayoutNode::Pane(id),
-                panes,
-                focus:            id,
-                next_id:          1,
-                overlay:          None,
-                mode:             DesktopMode::Tiling,
-                floating_windows: Vec::new(),
-                drag_state:       None,
-            },
-            reader,
+                Self {
+                    layout:           LayoutNode::Pane(id),
+                    panes,
+                    focus:            id,
+                    next_id:          1,
+                    overlay:          None,
+                    mode:             DesktopMode::Tiling,
+                    floating_windows: Vec::new(),
+                    drag_state:       None,
+                },
+                reader,
         ))
     }
 
@@ -235,7 +413,7 @@ impl AppState {
         &mut self,
         area: Rect,
         kind: SplitKind,
-        cmd:  Option<CommandBuilder>,
+        cmd:  Option<String>,
     ) -> Result<Option<(PaneId, Box<dyn Read + Send>)>> {
         let focus_id = self.focus;
         let mut focus_rect = area;
@@ -732,295 +910,274 @@ pub fn draw(
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " TDE ",
-                    Style::default()
+                    Span::styled(
+                        " TDE ",
+                        Style::default()
                         .fg(theme::TITLE_BADGE_FG)
                         .bg(theme::TITLE_BADGE_BG)
                         .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "  Terminal Desktop Environment  ",
-                    Style::default().fg(theme::ACCENT),
-                ),
-                Span::styled(
-                    mode_label,
-                    mode_style.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  [{} pane(s)]", state.panes.len()),
-                    Style::default().fg(theme::DIM_TEXT),
-                ),
+                    ),
+                    Span::styled(
+                        "  Terminal Desktop Environment  ",
+                        Style::default().fg(theme::ACCENT),
+                    ),
+                    Span::styled(
+                        mode_label,
+                        mode_style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  [{} pane(s)]", state.panes.len()),
+                        Style::default().fg(theme::DIM_TEXT),
+                    ),
             ])),
             top_area,
-        );
+            );
 
-        // ── Bottom bar: key hints (Tiling) or taskbar (Gui) ──────────────
-        match state.mode {
-            DesktopMode::Tiling => {
-                let is_explorer = matches!(
-                    state.panes.get(&state.focus),
-                    Some(AppPane::Explorer(_))
-                );
+            // ── Bottom bar: key hints (Tiling) or taskbar (Gui) ──────────────
+            match state.mode {
+                DesktopMode::Tiling => {
+                    let is_explorer = matches!(
+                        state.panes.get(&state.focus),
+                        Some(AppPane::Explorer(_))
+                    );
 
-                let mut hints: Vec<Span> = Vec::new();
+                    let mut hints: Vec<Span> = Vec::new();
 
-                if is_explorer {
-                    hints.extend([
-                        Span::styled(" c ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                        Span::styled("create │", Style::default().fg(theme::DIM_TEXT)),
-                        Span::styled(" D ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                        Span::styled("delete │", Style::default().fg(theme::DIM_TEXT)),
-                        Span::styled(" Enter ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                        Span::styled("open │", Style::default().fg(theme::DIM_TEXT)),
-                    ]);
-                }
-
-                hints.extend([
-                    Span::styled(" Alt+Space ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                    Span::styled("cmd │", Style::default().fg(theme::DIM_TEXT)),
-                    Span::styled(" Alt+E ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                    Span::styled("exp │", Style::default().fg(theme::DIM_TEXT)),
-                    Span::styled(" Alt+V/S ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                    Span::styled("split │", Style::default().fg(theme::DIM_TEXT)),
-                    Span::styled(" Alt+X ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                    Span::styled("close │", Style::default().fg(theme::DIM_TEXT)),
-                    Span::styled(" Alt+Arrows ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                    Span::styled("focus │", Style::default().fg(theme::DIM_TEXT)),
-                    Span::styled(" Alt+G ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                    Span::styled("gui │", Style::default().fg(theme::DIM_TEXT)),
-                    Span::styled(" Alt+Q ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
-                    Span::styled("quit", Style::default().fg(theme::DIM_TEXT)),
-                ]);
-
-                frame.render_widget(Paragraph::new(Line::from(hints)), bot_area);
-            }
-
-            DesktopMode::Gui => {
-                // ── Taskbar ───────────────────────────────────────────────
-                //
-                // Fix 2: badges are rendered in stable ascending PaneId order.
-                // The focused badge is highlighted blue+bold; its position in
-                // the bar never changes regardless of which window is "on top"
-                // in the compositor stack.
-                //
-                // Fix 3: each badge shows the live foreground process name
-                // instead of the static string "Terminal".
-                //
-                // Capacity: start-button + (sep + badge) per window.
-                let n_windows = state.floating_windows.len();
-                let mut taskbar: Vec<Span> = Vec::with_capacity(1 + n_windows * 2);
-
-                // Start button.
-                taskbar.push(Span::styled(
-                    "[ TDE Start ]",
-                    Style::default()
-                        .fg(theme::TITLE_BADGE_FG)
-                        .bg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ));
-
-                // Collect pane ids in stable ascending order (Fix 2).
-                let mut sorted_ids: Vec<PaneId> =
-                    state.floating_windows.iter().map(|w| w.id).collect();
-                sorted_ids.sort_unstable();
-
-                for id in sorted_ids {
-                    // Two-space separator before every badge.
-                    taskbar.push(Span::raw("  "));
-
-                    let is_focused = id == state.focus;
-
-                    // Fix 2: focused badge = blue background + bold white text.
-                    //        Unfocused badge = dim gray as before.
-                    let badge_style = if is_focused {
-                        Style::default()
-                            .fg(theme::TASKBAR_FOCUS_FG)
-                            .bg(theme::TASKBAR_FOCUS_BG)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme::DIM_TEXT)
-                    };
-
-                    // Fix 3: dynamic process name.
-                    let label = match state.panes.get(&id) {
-                        Some(AppPane::Terminal(term)) => {
-                            format!("[{}: {}]", id, term.foreground_process_name())
-                        }
-                        Some(AppPane::Explorer(_)) => format!("[{id}: Explorer]"),
-                        None                       => format!("[{id}: ?]"),
-                    };
-
-                    taskbar.push(Span::styled(label, badge_style));
-                }
-
-                frame.render_widget(Paragraph::new(Line::from(taskbar)), bot_area);
-            }
-        }
-
-        // ── Content area: branch on desktop mode ──────────────────────────
-        match state.mode {
-            // ── Tiling: existing zero-allocation walk_rects loop ──────────
-            DesktopMode::Tiling => {
-                let focus_id = state.focus;
-                state.layout.walk_rects(content_area, &mut |id, rect| {
-                    if rect.width < 2 || rect.height < 2 { return; }
-
-                    let Some(pane) = state.panes.get(&id) else { return };
-                    let focused = id == focus_id;
-
-                    match pane {
-                        // ── Fix 4: dead custom-command pane ───────────────
-                        AppPane::Terminal(term) if term.is_dead => {
-                            // Red border to signal the process has exited.
-                            let block = Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(
-                                    Style::default()
-                                        .fg(theme::DEAD_BORDER)
-                                        .add_modifier(Modifier::BOLD),
-                                )
-                                .title(Span::styled(
-                                    format!(" [{}] ✖ Process Completed — Alt+X to close ", id),
-                                    Style::default()
-                                        .fg(theme::DEAD_BORDER)
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-
-                            let inner = block.inner(rect);
-                            frame.render_widget(block, rect);
-
-                            // Render the last-known screen state so the output
-                            // is visible for the user to read.
-                            if inner.width > 0 && inner.height > 0 {
-                                let guard = term.parser.lock().expect("parser poisoned");
-                                frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
-                            }
-                        }
-
-                        // ── Live terminal pane ────────────────────────────
-                        AppPane::Terminal(term) => {
-                            let border_style = if focused {
-                                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(theme::DIM_BORDER)
-                            };
-
-                            let title_str = if focused {
-                                format!(" [{}] ● ", id)
-                            } else {
-                                format!(" [{}] ", id)
-                            };
-
-                            let title_style = if focused {
-                                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(theme::DIM_TEXT)
-                            };
-
-                            let block = Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(border_style)
-                                .title(Span::styled(title_str, title_style));
-
-                            let inner = block.inner(rect);
-                            frame.render_widget(block, rect);
-
-                            if inner.width > 0 && inner.height > 0 {
-                                let guard = term.parser.lock().expect("parser poisoned");
-                                frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
-                            }
-                        }
-
-                        // ── Explorer pane ─────────────────────────────────
-                        AppPane::Explorer(exp) => {
-                            let border_style = if focused {
-                                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(theme::DIM_BORDER)
-                            };
-
-                            let title_str = if focused {
-                                format!(" [{}] ● ", id)
-                            } else {
-                                format!(" [{}] ", id)
-                            };
-
-                            let title_style = if focused {
-                                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(theme::DIM_TEXT)
-                            };
-
-                            let block = Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(border_style)
-                                .title(Span::styled(title_str, title_style));
-
-                            let inner = block.inner(rect);
-                            frame.render_widget(block, rect);
-
-                            if inner.width > 0 && inner.height > 0 {
-                                let items: Vec<ListItem> = exp.entries.iter().map(|e| {
-                                    let icon  = if e.is_dir { "📁" } else { "📄" };
-                                    let style = if e.is_dir {
-                                        Style::default().fg(Color::Blue)
-                                    } else {
-                                        Style::default()
-                                    };
-                                    ListItem::new(format!(" {} {}", icon, e.name)).style(style)
-                                }).collect();
-
-                                let list = List::new(items)
-                                    .highlight_style(
-                                        Style::default()
-                                            .bg(Color::DarkGray)
-                                            .add_modifier(Modifier::BOLD),
-                                    )
-                                    .highlight_symbol(">> ");
-
-                                frame.render_stateful_widget(
-                                    list, inner,
-                                    &mut *exp.list_state.borrow_mut(),
-                                );
-                            }
-                        }
+                    if is_explorer {
+                        hints.extend([
+                            Span::styled(" c ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                            Span::styled("create │", Style::default().fg(theme::DIM_TEXT)),
+                            Span::styled(" D ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                            Span::styled("delete │", Style::default().fg(theme::DIM_TEXT)),
+                            Span::styled(" Enter ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                            Span::styled("open │", Style::default().fg(theme::DIM_TEXT)),
+                        ]);
                     }
-                });
+
+                    hints.extend([
+                        Span::styled(" Alt+Space ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                        Span::styled("cmd │", Style::default().fg(theme::DIM_TEXT)),
+                        Span::styled(" Alt+E ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                        Span::styled("exp │", Style::default().fg(theme::DIM_TEXT)),
+                        Span::styled(" Alt+V/S ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                        Span::styled("split │", Style::default().fg(theme::DIM_TEXT)),
+                        Span::styled(" Alt+X ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                        Span::styled("close │", Style::default().fg(theme::DIM_TEXT)),
+                        Span::styled(" Alt+Arrows ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                        Span::styled("focus │", Style::default().fg(theme::DIM_TEXT)),
+                        Span::styled(" Alt+G ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                        Span::styled("gui │", Style::default().fg(theme::DIM_TEXT)),
+                        Span::styled(" Alt+Q ", Style::default().fg(theme::KEY_HINT).add_modifier(Modifier::BOLD)),
+                        Span::styled("quit", Style::default().fg(theme::DIM_TEXT)),
+                    ]);
+
+                    frame.render_widget(Paragraph::new(Line::from(hints)), bot_area);
+                }
+
+                DesktopMode::Gui => {
+                    // ── Taskbar ───────────────────────────────────────────────
+                    //
+                    // Fix 2: badges are rendered in stable ascending PaneId order.
+                    // The focused badge is highlighted blue+bold; its position in
+                    // the bar never changes regardless of which window is "on top"
+                    // in the compositor stack.
+                    //
+                    // Fix 3: each badge shows the live foreground process name
+                    // instead of the static string "Terminal".
+                    //
+                    // Capacity: start-button + (sep + badge) per window.
+                    let n_windows = state.floating_windows.len();
+                    let mut taskbar: Vec<Span> = Vec::with_capacity(1 + n_windows * 2);
+
+                    // Start button.
+                    taskbar.push(Span::styled(
+                            "[ TDE Start ]",
+                            Style::default()
+                            .fg(theme::TITLE_BADGE_FG)
+                            .bg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+
+                    // Collect pane ids in stable ascending order (Fix 2).
+                    let mut sorted_ids: Vec<PaneId> =
+                        state.floating_windows.iter().map(|w| w.id).collect();
+                    sorted_ids.sort_unstable();
+
+                    for id in sorted_ids {
+                        // Two-space separator before every badge.
+                        taskbar.push(Span::raw("  "));
+
+                        let is_focused = id == state.focus;
+
+                        // Fix 2: focused badge = blue background + bold white text.
+                        //        Unfocused badge = dim gray as before.
+                        let badge_style = if is_focused {
+                            Style::default()
+                                .fg(theme::TASKBAR_FOCUS_FG)
+                                .bg(theme::TASKBAR_FOCUS_BG)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme::DIM_TEXT)
+                        };
+
+                        // Fix 3: dynamic process name.
+                        let label = match state.panes.get(&id) {
+                            Some(AppPane::Terminal(term)) => {
+                                format!("[{}: {}]", id, term.foreground_process_name())
+                            }
+                            Some(AppPane::Explorer(_)) => format!("[{id}: Explorer]"),
+                            None                       => format!("[{id}: ?]"),
+                        };
+
+                        taskbar.push(Span::styled(label, badge_style));
+                    }
+
+                    frame.render_widget(Paragraph::new(Line::from(taskbar)), bot_area);
+                }
             }
 
-            // ── GUI: floating compositor ──────────────────────────────────
-            DesktopMode::Gui => {
-                draw_gui(frame, state, content_area);
+            // ── Content area: branch on desktop mode ──────────────────────────
+            match state.mode {
+                // ── Tiling: existing zero-allocation walk_rects loop ──────────
+                DesktopMode::Tiling => {
+                    let focus_id = state.focus;
+                    state.layout.walk_rects(content_area, &mut |id, rect| {
+                        if rect.width < 2 || rect.height < 2 { return; }
+
+                        let Some(pane) = state.panes.get(&id) else { return };
+                        let focused = id == focus_id;
+
+                        match pane {
+                            // ── Fix 4: dead custom-command pane ───────────────
+                            AppPane::Terminal(term) if term.is_dead => {
+                                // Red border to signal the process has exited.
+                                let block = Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_style(
+                                        Style::default()
+                                        .fg(theme::DEAD_BORDER)
+                                        .add_modifier(Modifier::BOLD),
+                                    )
+                                    .title(Span::styled(
+                                            format!(" [{}] ✖ Process Completed — Alt+X to close ", id),
+                                            Style::default()
+                                            .fg(theme::DEAD_BORDER)
+                                            .add_modifier(Modifier::BOLD),
+                                    ));
+
+                                let inner = block.inner(rect);
+                                frame.render_widget(block, rect);
+
+                                // Render the last-known screen state so the output
+                                // is visible for the user to read.
+                                if inner.width > 0 && inner.height > 0 {
+                                    let guard = term.parser.lock().expect("parser poisoned");
+                                    frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
+                                }
+                            }
+
+                            // ── Live terminal pane ────────────────────────────
+                            AppPane::Terminal(term) => {
+                                let border_style = if focused {
+                                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme::DIM_BORDER)
+                                };
+
+                                let title_str = if focused {
+                                    format!(" [{}] ● ", id)
+                                } else {
+                                    format!(" [{}] ", id)
+                                };
+
+                                let title_style = if focused {
+                                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme::DIM_TEXT)
+                                };
+
+                                let block = Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_style(border_style)
+                                    .title(Span::styled(title_str, title_style));
+
+                                let inner = block.inner(rect);
+                                frame.render_widget(block, rect);
+
+                                if inner.width > 0 && inner.height > 0 {
+                                    let guard = term.parser.lock().expect("parser poisoned");
+                                    frame.render_widget(PseudoTerminal::new(guard.screen()), inner);
+                                }
+                            }
+
+                            // ── Explorer pane ─────────────────────────────────
+                            AppPane::Explorer(exp) => {
+                                let border_style = if focused {
+                                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme::DIM_BORDER)
+                                };
+
+                                let title_str = if focused {
+                                    format!(" [{}] ● ", id)
+                                } else {
+                                    format!(" [{}] ", id)
+                                };
+
+                                let title_style = if focused {
+                                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme::DIM_TEXT)
+                                };
+
+                                let block = Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_style(border_style)
+                                    .title(Span::styled(title_str, title_style));
+
+                                let inner = block.inner(rect);
+                                frame.render_widget(block, rect);
+
+                                if inner.width > 0 && inner.height > 0 {
+                                    render_explorer_grid(frame, exp, inner);
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // ── GUI: floating compositor ──────────────────────────────────
+                DesktopMode::Gui => {
+                    draw_gui(frame, state, content_area);
+                }
             }
-        }
 
-        // ── Draw Overlay (Always on top, both modes) ──────────────────────
-        if let Some(overlay) = &state.overlay {
-            // Fix 4: derive the area via `overlay_rect` so the mouse-dismiss
-            // logic uses the exact same bounding box as the renderer.
-            let overlay_area = overlay_rect(full);
+            // ── Draw Overlay (Always on top, both modes) ──────────────────────
+            if let Some(overlay) = &state.overlay {
+                // Fix 4: derive the area via `overlay_rect` so the mouse-dismiss
+                // logic uses the exact same bounding box as the renderer.
+                let overlay_area = overlay_rect(full);
 
-            frame.render_widget(Clear, overlay_area);
+                frame.render_widget(Clear, overlay_area);
 
-            let title = match overlay.action {
-                OverlayAction::SpawnCommand      => " Run Command (Alt+Space) ",
-                OverlayAction::CreateFile { .. } => " Create File/Dir (ends with / for dir) ",
-            };
+                let title = match overlay.action {
+                    OverlayAction::SpawnCommand      => " Run Command (Alt+Space) ",
+                    OverlayAction::CreateFile { .. } => " Create File/Dir (ends with / for dir) ",
+                };
 
-            let block = Block::default()
-                .title(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::ACCENT));
+                let block = Block::default()
+                    .title(Span::styled(
+                            title,
+                            Style::default()
+                            .fg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::ACCENT));
 
-            let text = format!(" {}█", overlay.input);
-            frame.render_widget(Paragraph::new(text).block(block), overlay_area);
-        }
+                let text = format!(" {}█", overlay.input);
+                frame.render_widget(Paragraph::new(text).block(block), overlay_area);
+            }
     })?;
     Ok(())
 }
@@ -1059,7 +1216,8 @@ fn handle_event(
             if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&pane_id) {
                 exp.cwd = path;
                 exp.entries = entries;
-                exp.list_state.borrow_mut().select(Some(0));
+                *exp.selected_index.borrow_mut() = 0;
+                *exp.scroll_offset.borrow_mut() = 0;
             }
             *needs_draw = true;
         }
@@ -1089,8 +1247,8 @@ fn handle_event(
             if !retain {
                 let quit = state.close_pane(pane_id, *area)?;
                 dlog(&format!(
-                    "event_loop: after close_pane should_quit={quit} remaining_panes={}",
-                    state.panes.len()
+                        "event_loop: after close_pane should_quit={quit} remaining_panes={}",
+                        state.panes.len()
                 ));
                 if quit {
                     *should_quit = true;
@@ -1149,91 +1307,304 @@ fn handle_event(
             // swallow the click — do not route it to the underlying content.
             Event::Mouse(m)
                 if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) =>
-            {
-                // Reconstruct `full` from `area` (content rect).
-                // `area` = { x:0, y:1, width:cols, height:rows-2 }
-                // `full` = { x:0, y:0, width:cols, height:rows }
-                //        = area offset by the top chrome row, plus both chrome rows.
-                let full = Rect {
-                    x:      0,
-                    y:      0,
-                    width:  area.width,
-                    height: area.height + 2, // content + top bar + bottom bar
-                };
+                {
+                    // Reconstruct `full` from `area` (content rect).
+                    // `area` = { x:0, y:1, width:cols, height:rows-2 }
+                    // `full` = { x:0, y:0, width:cols, height:rows }
+                    //        = area offset by the top chrome row, plus both chrome rows.
+                    let full = Rect {
+                        x:      0,
+                        y:      0,
+                        width:  area.width,
+                        height: area.height + 2, // content + top bar + bottom bar
+                    };
 
-                // Fix 4: overlay dismiss — check before any other routing.
-                if state.overlay.is_some() {
-                    let ov = overlay_rect(full);
-                    // Test whether the click is OUTSIDE the popup.
-                    let inside = m.column >= ov.x
-                        && m.column < ov.x.saturating_add(ov.width)
-                        && m.row    >= ov.y
-                        && m.row    < ov.y.saturating_add(ov.height);
+                    // Fix 4: overlay dismiss — check before any other routing.
+                    if state.overlay.is_some() {
+                        let ov = overlay_rect(full);
+                        // Test whether the click is OUTSIDE the popup.
+                        let inside = m.column >= ov.x
+                            && m.column < ov.x.saturating_add(ov.width)
+                            && m.row    >= ov.y
+                            && m.row    < ov.y.saturating_add(ov.height);
 
-                    if !inside {
-                        state.overlay = None;
+                        if !inside {
+                            state.overlay = None;
+                            *needs_draw = true;
+                            // Swallow the click — do not focus/drag underneath.
+                            return Ok(());
+                        }
+                        // Click was inside the popup — fall through so the user
+                        // can position the cursor or interact.  No routing to
+                        // underlying panes since the overlay consumes input.
                         *needs_draw = true;
-                        // Swallow the click — do not focus/drag underneath.
                         return Ok(());
                     }
-                    // Click was inside the popup — fall through so the user
-                    // can position the cursor or interact.  No routing to
-                    // underlying panes since the overlay consumes input.
-                    *needs_draw = true;
-                    return Ok(());
+
+                    let on_taskbar = m.row >= area.y + area.height;
+
+                    if on_taskbar && state.mode == DesktopMode::Gui {
+                        if state.click_taskbar(m.column) {
+                            *needs_draw = true;
+                        }
+                    } else {
+                        let changed = state.click_focus(*area, m.column, m.row);
+                        enum ExplorerClickAction {
+                            OpenDir(PathBuf),
+                            OpenFile(PathBuf),
+                        }
+
+                        let mut explorer_action: Option<ExplorerClickAction> = None;
+
+                        let focused_id = state.focus;
+
+                        let pane_rect = match state.mode {
+                            DesktopMode::Tiling => {
+                                let mut found = None;
+
+                                state.layout.walk_rects(*area, &mut |id, rect| {
+                                    if id == focused_id {
+                                        found = Some(rect);
+                                    }
+                                });
+
+                                found
+                            }
+
+                            DesktopMode::Gui => {
+                                state
+                                    .floating_windows
+                                    .iter()
+                                    .find(|w| w.id == focused_id)
+                                    .map(|w| w.area)
+                            }
+                        };
+
+                        if let Some(rect) = pane_rect {
+                            if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&focused_id) {
+
+                                if m.row >= rect.y + 3 {
+
+                                    let local_x = m.column.saturating_sub(rect.x);
+                                    let local_y = m.row.saturating_sub(rect.y + 3);
+
+                                    let cell_width: u16 = 14;
+                                    let cell_height: u16 = 4;
+
+                                    let cols =
+                                        ((rect.width.max(cell_width)) / cell_width).max(1) as usize;
+
+                                    let grid_col = (local_x / cell_width) as usize;
+                                    let grid_row = (local_y / cell_height) as usize;
+
+                                    let scroll_offset = *exp.scroll_offset.borrow();
+
+                                    let clicked_idx =
+                                        ((scroll_offset + grid_row) * cols) + grid_col;
+
+                                    if clicked_idx < exp.entries.len() {
+
+                                        let selection_changed = *exp.selected_index.borrow() != clicked_idx;
+                                        *exp.selected_index.borrow_mut() = clicked_idx;
+                                        if selection_changed {
+                                            *needs_draw = true;
+                                        }
+
+                                        let now = Instant::now();
+
+                                        let is_double_click = {
+                                            let mut last = exp.last_click.borrow_mut();
+
+                                            let result = match *last {
+                                                Some((idx, ts))
+                                                    if idx == clicked_idx
+                                                        && now.duration_since(ts)
+                                                            < Duration::from_millis(500) =>
+                                                    {
+                                                        true
+                                                    }
+
+                                                _ => false,
+                                            };
+
+                                            *last = Some((clicked_idx, now));
+
+                                            result
+                                        };
+
+                                        if is_double_click {
+                                            let entry = exp.entries[clicked_idx].clone();
+
+                                            let path = if entry.name == ".." {
+                                                exp.cwd
+                                                    .parent()
+                                                    .map(|p| p.to_path_buf())
+                                                    .unwrap_or_else(|| exp.cwd.clone())
+                                            } else {
+                                                exp.cwd.join(&entry.name)
+                                            };
+
+                                            explorer_action = Some(
+                                                if entry.is_dir {
+                                                    ExplorerClickAction::OpenDir(path)
+                                                } else {
+                                                    ExplorerClickAction::OpenFile(path)
+                                                }
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        match explorer_action {
+                            Some(ExplorerClickAction::OpenDir(path)) => {
+                                spawn_dir_read(focused_id, path, tx.clone());
+                                *needs_draw = true;
+                            }
+
+                            Some(ExplorerClickAction::OpenFile(path)) => {
+                                let cmd_str = format!("nvim {}", path.display());
+
+                                if let Some((new_id, reader)) =
+                                    state.do_split(*area, SplitKind::Vertical, Some(cmd_str))?
+                                {
+                                    spawn_pane_reader(new_id, reader, tx.clone());
+                                }
+
+                                *needs_draw = true;
+                            }
+
+                            None => {}
+                        }
+
+                        if state.mode == DesktopMode::Gui {
+                            if !state.floating_windows.is_empty() {
+                                state.drag_state = Some((state.focus, m.column, m.row));
+                            }
+                        }
+
+                        if changed {
+                            *needs_draw = true;
+                        }
+                    }
                 }
 
-                let on_taskbar = m.row >= area.y + area.height;
+            // ── Drag: move the focused floating window ────────────────────
+            //
+            // Unsnap logic: if the window being dragged is currently snapped
+            // (unsnapped_area.is_some()), restore its pre-snap geometry first,
+            // then re-centre it under the cursor before applying normal delta
+            // movement.  This gives the Windows-Aero-Snap "grab and pull away"
+            // behaviour without any heap allocation.
+            Event::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)) =>
+                {
+                    if let Some((id, last_x, last_y)) = state.drag_state {
+                        let dx = m.column as i32 - last_x as i32;
+                        let dy = m.row    as i32 - last_y as i32;
 
-                if on_taskbar && state.mode == DesktopMode::Gui {
-                    if state.click_taskbar(m.column) {
+                        if let Some(win) = state.floating_windows.iter_mut().find(|w| w.id == id) {
+                            // ── Unsnap: restore saved geometry and re-centre ──
+                            if let Some(saved) = win.unsnapped_area.take() {
+                                win.area = saved;
+                                // Horizontally centre the restored window on the
+                                // cursor so it doesn't jump to an arbitrary edge.
+                                win.area.x = m.column.saturating_sub(win.area.width / 2);
+                                // win.area.y is kept from the saved rect; the
+                                // normal boundary-clamping below will correct it
+                                // if it has gone out of range.
+                            }
+
+                            // ── Normal delta movement ─────────────────────────
+                            let new_x = win.area.x as i32 + dx;
+                            let new_y = win.area.y as i32 + dy;
+
+                            let max_x = area.width.saturating_sub(win.area.width) as i32;
+                            let max_y = area.height.saturating_sub(win.area.height) as i32;
+
+                            win.area.x = new_x.max(0).min(max_x) as u16;
+                            win.area.y = new_y.max(0).min(max_y) as u16;
+                        }
+
+                        state.drag_state = Some((id, m.column, m.row));
                         *needs_draw = true;
                     }
-                } else {
-                    let changed = state.click_focus(*area, m.column, m.row);
+                }
 
-                    if state.mode == DesktopMode::Gui {
-                        if !state.floating_windows.is_empty() {
-                            state.drag_state = Some((state.focus, m.column, m.row));
+            // ── Mouse-up: release drag, apply snap if at an edge ─────────
+            //
+            // Aero-Snap zones (all thresholds use saturating arithmetic):
+            //
+            //   Left snap   — cursor column ≤ area.x + 1
+            //                 → fills left half  (x: area.x, w: area.width/2)
+            //   Right snap  — cursor column ≥ area.x + area.width - 2
+            //                 → fills right half (x: area.x + area.width/2, w: area.width - area.width/2)
+            //   Maximise    — cursor row    ≤ area.y + 1
+            //                 → fills entire content area
+            //
+            // In every snap case the current `win.area` is first saved into
+            // `win.unsnapped_area` (only when not already snapped, to avoid
+            // overwriting the original geometry with a half-screen rect).
+            Event::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) =>
+                {
+                    if let Some((id, _, _)) = state.drag_state {
+                        if let Some(win) = state.floating_windows.iter_mut().find(|w| w.id == id) {
+                            // Snap-zone thresholds.
+                            let left_edge  = area.x.saturating_add(1);
+                            let right_edge = area.x.saturating_add(area.width).saturating_sub(2);
+                            let top_edge   = area.y.saturating_add(1);
+
+                            if m.column <= left_edge {
+                                // ── Left snap ────────────────────────────────
+                                if win.unsnapped_area.is_none() {
+                                    win.unsnapped_area = Some(win.area);
+                                }
+                                let half_w = area.width / 2;
+                                win.area = Rect {
+                                    x:      area.x,
+                                    y:      area.y,
+                                    width:  half_w,
+                                    height: area.height,
+                                };
+
+                            } else if m.column >= right_edge {
+                                // ── Right snap ───────────────────────────────
+                                if win.unsnapped_area.is_none() {
+                                    win.unsnapped_area = Some(win.area);
+                                }
+                                let half_w = area.width / 2;
+                                win.area = Rect {
+                                    x:      area.x.saturating_add(half_w),
+                                    y:      area.y,
+                                    // Give the right pane the remaining width so
+                                    // the two halves tile without a gap on odd
+                                    // terminal widths.
+                                    width:  area.width.saturating_sub(half_w),
+                                    height: area.height,
+                                };
+
+                            } else if m.row <= top_edge {
+                                // ── Maximise ─────────────────────────────────
+                                if win.unsnapped_area.is_none() {
+                                    win.unsnapped_area = Some(win.area);
+                                }
+                                win.area = Rect {
+                                    x:      area.x,
+                                    y:      area.y,
+                                    width:  area.width,
+                                    height: area.height,
+                                };
+                            }
+                            // No snap zone hit → area unchanged, leave
+                            // unsnapped_area as-is (None for a normal float,
+                            // Some(_) if it was already snapped before this drag).
                         }
                     }
 
-                    if changed {
-                        *needs_draw = true;
-                    }
-                }
-            }
-
-            // ── Drag: move the focused floating window ────────────────────
-            Event::Mouse(m)
-                if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)) =>
-            {
-                if let Some((id, last_x, last_y)) = state.drag_state {
-                    let dx = m.column as i32 - last_x as i32;
-                    let dy = m.row    as i32 - last_y as i32;
-
-                    if let Some(win) = state.floating_windows.iter_mut().find(|w| w.id == id) {
-                        let new_x = win.area.x as i32 + dx;
-                        let new_y = win.area.y as i32 + dy;
-
-                        let max_x = area.width.saturating_sub(win.area.width) as i32;
-                        let max_y = area.height.saturating_sub(win.area.height) as i32;
-
-                        win.area.x = new_x.max(0).min(max_x) as u16;
-                        win.area.y = new_y.max(0).min(max_y) as u16;
-                    }
-
-                    state.drag_state = Some((id, m.column, m.row));
+                    state.drag_state = None;
                     *needs_draw = true;
                 }
-            }
-
-            // ── Mouse-up: release drag ────────────────────────────────────
-            Event::Mouse(m)
-                if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) =>
-            {
-                state.drag_state = None;
-            }
 
             // ── Scroll wheel: Explorer navigation ────────────────────────
             Event::Mouse(m)
@@ -1241,27 +1612,57 @@ fn handle_event(
                     m.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) =>
-            {
-                let focused_id = state.focus;
-                if let Some(AppPane::Explorer(exp)) = state.panes.get_mut(&focused_id) {
-                    let i = exp.list_state.borrow().selected().unwrap_or(0);
-                    match m.kind {
-                        MouseEventKind::ScrollUp => {
-                            if i > 0 {
-                                exp.list_state.borrow_mut().select(Some(i - 1));
-                                *needs_draw = true;
-                            }
+                {
+                    let focused_id = state.focus;
+
+                    let pane_rect = match state.mode {
+                        DesktopMode::Tiling => {
+                            let mut found = None;
+
+                            state.layout.walk_rects(*area, &mut |id, rect| {
+                                if id == focused_id {
+                                    found = Some(rect);
+                                }
+                            });
+
+                            found
                         }
-                        MouseEventKind::ScrollDown => {
-                            if i < exp.entries.len().saturating_sub(1) {
-                                exp.list_state.borrow_mut().select(Some(i + 1));
-                                *needs_draw = true;
-                            }
+
+                        DesktopMode::Gui => state
+                            .floating_windows
+                            .iter()
+                            .find(|w| w.id == focused_id)
+                            .map(|w| w.area),
+                    };
+
+                    if let (Some(rect), Some(AppPane::Explorer(exp))) =
+                        (pane_rect, state.panes.get_mut(&focused_id))
+                    {
+                        let inner_width = rect.width.saturating_sub(2);
+                        let inner_height = rect.height.saturating_sub(2);
+                        let grid_width = inner_width;
+                        let grid_height = inner_height.saturating_sub(3);
+
+                        let cell_width: u16 = 14;
+                        let cell_height: u16 = 4;
+                        let cols = (grid_width / cell_width).max(1) as usize;
+                        let visible_rows = (grid_height / cell_height).max(1) as usize;
+                        let total_rows = exp.entries.len().div_ceil(cols);
+                        let max_scroll = total_rows.saturating_sub(visible_rows);
+
+                        let cur = *exp.scroll_offset.borrow();
+                        let next = match m.kind {
+                            MouseEventKind::ScrollUp => cur.saturating_sub(1),
+                            MouseEventKind::ScrollDown => cur.saturating_add(1).min(max_scroll),
+                            _ => cur,
+                        };
+
+                        if next != cur {
+                            *exp.scroll_offset.borrow_mut() = next;
+                            *needs_draw = true;
                         }
-                        _ => {}
                     }
                 }
-            }
 
             Event::Mouse(_) => {}
             _ => {}
@@ -1303,5 +1704,117 @@ pub async fn run_event_loop(
         if should_quit { break; }
         if needs_draw  { draw(terminal, state)?; }
     }
+
+    // Save the session to ~/.config/tde/session.json exactly once on exit
+    let session_dir = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".config").join("tde"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/tde"));
+    let session_path = session_dir.join("session.json");
+
+    if let Err(e) = save_session(state, &session_path) {
+        dlog(&format!("Failed to save session: {}", e));
+    }
+
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// § 19  Grid Renderer (Dolphin-style Large Icons)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn render_explorer_grid(
+    frame: &mut ratatui::Frame,
+    exp: &ExplorerPane,
+    area: Rect,
+) {
+    if area.height < 6 {
+        return;
+    }
+
+    let header_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 3,
+    };
+
+    let grid_area = Rect {
+        x: area.x,
+        y: area.y + 3,
+        width: area.width,
+        height: area.height.saturating_sub(3),
+    };
+
+    let header = Block::default().borders(Borders::BOTTOM);
+    let header_inner = header.inner(header_area);
+
+    frame.render_widget(header, header_area);
+
+    frame.render_widget(
+        Paragraph::new(format!(" 📁 {} ", exp.cwd.display())),
+        header_inner,
+    );
+
+    let cell_width = 14;
+    let cell_height = 4;
+
+    if grid_area.width < cell_width || grid_area.height < cell_height {
+        return;
+    }
+
+    let cols = (grid_area.width / cell_width).max(1) as usize;
+    let rows = (grid_area.height / cell_height).max(1) as usize;
+
+    let selected = *exp.selected_index.borrow();
+
+    // Clamp the viewport scroll to valid grid rows, but do not force the
+    // selected item back into view. Mouse-wheel scrolling should move the
+    // visible viewport like a desktop file manager, independent of selection.
+    let total_rows = exp.entries.len().div_ceil(cols);
+    let max_scroll = total_rows.saturating_sub(rows);
+    let scroll = (*exp.scroll_offset.borrow()).min(max_scroll);
+    *exp.scroll_offset.borrow_mut() = scroll;
+
+    let start_idx = scroll * cols;
+    let end_idx = (start_idx + rows * cols).min(exp.entries.len());
+
+    // ── Draw Visible Cells ──
+    for i in start_idx..end_idx {
+        let entry = &exp.entries[i];
+        let is_selected = i == selected;
+
+        let rel_idx = i - start_idx;
+        let grid_x = (rel_idx % cols) as u16;
+        let grid_y = (rel_idx / cols) as u16;
+
+        let cell_rect = Rect {
+            x: grid_area.x + grid_x * cell_width,
+            y: grid_area.y + grid_y * cell_height,
+            width: cell_width,
+            height: cell_height,
+        };
+
+        let icon = if entry.is_dir { "📁" } else { "📄" };
+        let icon_style = if entry.is_dir { Style::default().fg(Color::Blue) } else { Style::default() };
+        let text_style = if is_selected {
+            Style::default().bg(theme::ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        // Truncate long filenames cleanly
+        let mut name = entry.name.clone();
+        if name.len() > (cell_width - 2) as usize {
+            name.truncate((cell_width - 5) as usize);
+            name.push_str("...");
+        }
+
+        let icon_line = Line::from(Span::styled(format!("  {}  ", icon), icon_style)).alignment(Alignment::Center);
+        let name_line = Line::from(Span::styled(name, text_style)).alignment(Alignment::Center);
+
+        let p = Paragraph::new(vec![Line::default(), icon_line, name_line])
+            .style(if is_selected { Style::default().bg(Color::DarkGray) } else { Style::default() });
+
+        frame.render_widget(p, cell_rect);
+    }
 }
