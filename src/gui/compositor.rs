@@ -76,17 +76,24 @@ pub fn draw_gui(frame: &mut Frame, state: &AppState, full_area: Rect) {
         frame.render_widget(Clear, win.area);
 
         // b. Window chrome.
+        let is_dead = match pane {
+            AppPane::Terminal(t) => t.is_dead,
+            _ => false,
+        };
+
         let border_style = if focused {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else if is_dead {
+            Style::default().fg(theme::DEAD_BORDER)
         } else {
             Style::default().fg(theme::DIM_BORDER)
         };
 
         let title_str = match pane {
             AppPane::Terminal(_) => {
-                if focused {
+                if is_dead {
+                    format!(" [{}] ✖ Process Completed — Alt+X to close ", win.id)
+                } else if focused {
                     format!(" [{}] ● Terminal ", win.id)
                 } else {
                     format!(" [{}] Terminal ", win.id)
@@ -102,9 +109,9 @@ pub fn draw_gui(frame: &mut Frame, state: &AppState, full_area: Rect) {
         };
 
         let title_style = if focused {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else if is_dead {
+            Style::default().fg(theme::DEAD_BORDER).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::DIM_TEXT)
         };

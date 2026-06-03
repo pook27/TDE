@@ -93,7 +93,7 @@ impl TerminalPane {
             .context("openpty")?;
 
         let is_custom = custom_command.is_some();
-        
+
         // Parse the raw command string into a CommandBuilder
         let cmd = if let Some(ref cmd_str) = custom_command {
             let mut parts = cmd_str.trim().split_whitespace();
@@ -109,24 +109,37 @@ impl TerminalPane {
             shell_cmd()
         };
 
-        let child     = pair.slave.spawn_command(cmd).context("spawn shell")?;
-        let reader    = pair.master.try_clone_reader().context("clone PTY reader")?;
-        let writer    = pair.master.take_writer().context("take PTY writer")?;
-        let parser    = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(c) => c,
+            Err(e) => {
+                // If the command is misspelled, don't crash TDE! 
+                // Spawn a fallback shell to display the error directly inside the pane.
+                let err_msg = format!("TDE Error: Failed to spawn command.\r\n{}\r\n\r\nPress Enter to close.", e);
+                let safe_msg = err_msg.replace('\'', "'\\''");
+                
+                let mut fallback = CommandBuilder::new("sh");
+                fallback.arg("-c");
+                fallback.arg(format!("echo '{}'; read", safe_msg));
+                pair.slave.spawn_command(fallback).context("spawn fallback")?
+            }
+        };
+        let reader = pair.master.try_clone_reader().context("clone PTY reader")?;
+        let writer = pair.master.take_writer().context("take PTY writer")?;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
 
         Ok((
-            Self {
-                id,
-                _child:     child,
-                master:     pair.master,
-                writer,
-                parser,
-                custom_command,
-                is_custom,
-                is_dead:    false,
-                proc_cache: ProcNameCache::new(),
-            },
-            reader,
+                Self {
+                    id,
+                    _child:     child,
+                    master:     pair.master,
+                    writer,
+                    parser,
+                    custom_command,
+                    is_custom,
+                    is_dead:    false,
+                    proc_cache: ProcNameCache::new(),
+                },
+                reader,
         ))
     }
 

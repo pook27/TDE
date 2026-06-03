@@ -415,6 +415,21 @@ impl AppState {
         kind: SplitKind,
         cmd:  Option<String>,
     ) -> Result<Option<(PaneId, Box<dyn Read + Send>)>> {
+        let new_id = self.next_id;
+        self.next_id += 1;
+        // ── Handle spawning from an empty desktop ─────────────────────────
+        if self.panes.is_empty() {
+            let rows = area.height.saturating_sub(2).max(2);
+            let cols = area.width.saturating_sub(2).max(8);
+            let (pane, reader) = TerminalPane::new(new_id, rows, cols, cmd)?;
+            self.panes.insert(new_id, AppPane::Terminal(pane));
+            self.layout = LayoutNode::Pane(new_id);
+            self.focus = new_id;
+            if self.mode == DesktopMode::Gui {
+                self.floating_windows.push(FloatingWindow::new(new_id, cascade_rect(0, area)));
+            }
+            return Ok(Some((new_id, reader)));
+        }
         let focus_id = self.focus;
         let mut focus_rect = area;
         self.layout.walk_rects(area, &mut |id, rect| {
@@ -477,6 +492,17 @@ impl AppState {
             .unwrap_or_else(|_| PathBuf::from("/"));
         let explorer = ExplorerPane::new(new_id, home.clone());
 
+        // ── Handle spawning from an empty desktop ─────────────────────────
+        if self.panes.is_empty() {
+            self.panes.insert(new_id, AppPane::Explorer(explorer));
+            self.layout = LayoutNode::Pane(new_id);
+            self.focus = new_id;
+            if self.mode == DesktopMode::Gui {
+                self.floating_windows.push(FloatingWindow::new(new_id, cascade_rect(0, area)));
+            }
+            spawn_dir_read(new_id, home, tx);
+            return Ok(());
+        }
         self.panes.insert(new_id, AppPane::Explorer(explorer));
         self.layout.split_pane(self.focus, new_id, kind);
         self.focus = new_id;
@@ -535,7 +561,8 @@ impl AppState {
         if self.panes.len() == 1 {
             self.panes.remove(&target);
             self.floating_windows.retain(|w| w.id != target);
-            return Ok(true);
+            self.layout = LayoutNode::Sentinel; // Empty the tree
+            return Ok(false);
         }
 
         // ── Choose the pane that will receive focus after removal ─────────
@@ -758,8 +785,12 @@ impl AppState {
     fn taskbar_label_for(&self, id: PaneId) -> String {
         match self.panes.get(&id) {
             Some(AppPane::Terminal(term)) => {
-                let proc_name = term.foreground_process_name();
-                format!("{id}: {proc_name}")
+                if term.is_dead {
+                    format!("{id}: [Exited]")
+                } else {
+                    let proc_name = term.foreground_process_name();
+                    format!("{id}: {proc_name}")
+                }
             }
             Some(AppPane::Explorer(_)) => format!("{id}: Explorer"),
             None                       => format!("{id}: ?"),
