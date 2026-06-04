@@ -9,7 +9,7 @@
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
@@ -76,10 +76,131 @@ pub fn forward_key(key: KeyEvent, writer: &mut Box<dyn Write + Send>) -> Result<
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// § 3  Input dispatcher
+// § 2b  Context-menu mouse dispatch
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Handle a mouse event that arrived while a `ContextMenu` overlay is active.
+///
+/// Called by `handle_event` in `app.rs` **before** the normal left-click
+/// routing, so every mouse interaction with an open menu is resolved here and
+/// the event is never forwarded to the underlying panes.
+///
+/// ## Return value
+///
+/// `Ok(Some((id, reader)))` — a new terminal pane was spawned (Open → nvim).
+///  The caller must call `spawn_pane_reader` before the next draw.
+///
+/// `Ok(None)` — state was mutated in-place; no new pane.
+///
+/// ## Hit-test geometry
+///
+/// The renderer (`app.rs` § Draw Overlay) places the menu at:
+///
+/// ```text
+///   ┌──────────────────┐  ← row y        (border)
+///   │ ▶  📂 Open       │  ← row y + 1    item 0
+///   │    🗑  Delete     │  ← row y + 2    item 1
+///   │    ❌ Cancel      │  ← row y + 3    item 2
+///   └──────────────────┘  ← row y + 4    (border)
+///     ^                ^
+///   col x           col x + MENU_W - 1
+/// ```
+///
+/// `MENU_W = 20` matches the `const MENU_W: u16 = 20` in `draw()`.
+/// Inner columns run from `x + 1` to `x + MENU_W - 2` inclusive; we accept
+/// any column in `x .. x + MENU_W` for a forgiving click target.
+pub fn dispatch_mouse_overlay(
+    state: &mut AppState,
+    area:  Rect,
+    m:     MouseEvent,
+    tx:    &mpsc::Sender<AppEvent>,
+) -> Result<Option<(PaneId, Box<dyn Read + Send>)>> {
+    // Pull the overlay out; we will decide whether to put it back.
+    let overlay = match state.overlay.take() {
+        Some(o) => o,
+        None    => return Ok(None),
+    };
+
+    // Only handle the ContextMenu variant; restore and bail for anything else.
+    let (target_path, is_dir, ox, oy) = match &overlay.action {
+        OverlayAction::ContextMenu { target_path, is_dir, x, y, .. } => {
+            (target_path.clone(), *is_dir, *x, *y)
+        }
+        _ => {
+            state.overlay = Some(overlay);
+            return Ok(None);
+        }
+    };
+
+    // Only act on left mouse-button presses; ignore moves, scrolls, releases.
+    if m.kind != MouseEventKind::Down(MouseButton::Left) {
+        state.overlay = Some(overlay);
+        return Ok(None);
+    }
+
+    // ── Hit-test ─────────────────────────────────────────────────────────────
+    //
+    // MENU_W must match the renderer constant in app.rs § Draw Overlay.
+    // Items live on rows oy+1, oy+2, oy+3 (inside the 1-cell border).
+    const MENU_W: u16 = 20;
+
+    let col_hit = m.column >= ox && m.column < ox + MENU_W;
+    let row_hit = m.row >= oy + 1 && m.row <= oy + 3;
+
+    if col_hit && row_hit {
+        // Which item did the user click?  Row oy+1 → index 0, oy+3 → index 2.
+        let clicked_index = (m.row - oy - 1) as usize;
+
+        // overlay is dropped here — menu dismissed regardless of action.
+        drop(overlay);
+
+        match clicked_index {
+            // ── 0: Open ───────────────────────────────────────────────────
+            0 => {
+                if is_dir {
+                    let focused_id = state.focus;
+                    if let Some(AppPane::Explorer(exp)) = state.panes.get(&focused_id) {
+                        spawn_dir_read(exp.id, target_path, tx.clone());
+                    }
+                } else {
+                    let cmd_str = format!("nvim {}", target_path.display());
+                    if let Some((new_id, reader)) =
+                        state.do_split(area, SplitKind::Vertical, Some(cmd_str))?
+                    {
+                        return Ok(Some((new_id, reader)));
+                    }
+                }
+            }
+
+            // ── 1: Delete ─────────────────────────────────────────────────
+            1 => {
+                if is_dir {
+                    let _ = std::fs::remove_dir_all(&target_path);
+                } else {
+                    let _ = std::fs::remove_file(&target_path);
+                }
+                let focused_id = state.focus;
+                if let Some(AppPane::Explorer(exp)) = state.panes.get(&focused_id) {
+                    spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
+                }
+            }
+
+            // ── 2: Cancel — overlay already dropped, nothing to do ────────
+            _ => {}
+        }
+    }
+    // Clicked outside the menu bounds → overlay was already dropped (dismissed).
+
+    Ok(None)
+}
+
+
+
 /// Process one key event.
+///
+/// Mouse events that arrive while a `ContextMenu` overlay is active are handled
+/// by the companion [`dispatch_mouse_overlay`] function, which `handle_event`
+/// calls before routing the event here.
 ///
 /// Returns `(should_quit, Option<(PaneId, reader)>)`:
 /// - `should_quit` → event loop must break.
@@ -99,6 +220,92 @@ pub fn dispatch_input(
 
     // ── 1. Intercept input if Overlay is active ──────────────────────────────
     if let Some(mut overlay) = state.overlay.take() {
+        // ── Context Menu: special key-routing ─────────────────────────────
+        if let OverlayAction::ContextMenu { ref target_path, is_dir, ref mut menu_index, .. } =
+            overlay.action
+        {
+            const MENU_LEN: usize = 3;
+
+            match key.code {
+                // Dismiss on Escape
+                KeyCode::Esc => {
+                    // overlay dropped → dismissed
+                    return Ok((false, None));
+                }
+
+                // Navigate the highlight
+                KeyCode::Up => {
+                    *menu_index = (*menu_index + MENU_LEN - 1) % MENU_LEN;
+                    state.overlay = Some(overlay);
+                    return Ok((false, None));
+                }
+                KeyCode::Down => {
+                    *menu_index = (*menu_index + 1) % MENU_LEN;
+                    state.overlay = Some(overlay);
+                    return Ok((false, None));
+                }
+
+                // Execute the highlighted action
+                KeyCode::Enter => {
+                    let idx   = *menu_index;
+                    let path  = target_path.clone();
+                    let is_d  = is_dir;
+                    // overlay is dropped here — menu dismissed
+                    drop(overlay);
+
+                    match idx {
+                        // ── 0: Open ───────────────────────────────────────
+                        0 => {
+                            if is_d {
+                                // Navigate the *focused* Explorer pane into the dir.
+                                let focused_id = state.focus;
+                                if let Some(AppPane::Explorer(exp)) =
+                                    state.panes.get(&focused_id)
+                                {
+                                    spawn_dir_read(exp.id, path, tx.clone());
+                                }
+                            } else {
+                                // Open the file in nvim via a new split.
+                                let cmd_str = format!("nvim {}", path.display());
+                                if let Some((new_id, reader)) =
+                                    state.do_split(area, SplitKind::Vertical, Some(cmd_str))?
+                                {
+                                    return Ok((false, Some((new_id, reader))));
+                                }
+                            }
+                        }
+
+                        // ── 1: Delete ─────────────────────────────────────
+                        1 => {
+                            if is_d {
+                                let _ = std::fs::remove_dir_all(&path);
+                            } else {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                            // Refresh the focused Explorer pane.
+                            let focused_id = state.focus;
+                            if let Some(AppPane::Explorer(exp)) =
+                                state.panes.get(&focused_id)
+                            {
+                                spawn_dir_read(exp.id, exp.cwd.clone(), tx.clone());
+                            }
+                        }
+
+                        // ── 2: Cancel (and any other index) ───────────────
+                        _ => { /* overlay already dropped — nothing to do */ }
+                    }
+                    return Ok((false, None));
+                }
+
+                // Any other key: keep menu open, ignore keypress
+                _ => {
+                    state.overlay = Some(overlay);
+                    return Ok((false, None));
+                }
+            }
+        }
+
+        // ── Text-input overlays (SpawnCommand, CreateFile) ────────────────
         match key.code {
             KeyCode::Esc => {
                 // Cancel overlay (state.overlay remains None)
@@ -145,6 +352,8 @@ pub fn dispatch_input(
                             }
                         }
                     }
+                    // ContextMenu is handled above; this arm is unreachable.
+                    OverlayAction::ContextMenu { .. } => {}
                 }
             }
             _ => {

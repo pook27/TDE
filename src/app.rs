@@ -38,7 +38,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect, Alignment},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Terminal,
 };
 use tokio::sync::mpsc;
@@ -53,6 +53,9 @@ pub enum AppEvent {
     PtyExited { pane_id: PaneId },
     Input(Event),
     ExplorerUpdate { pane_id: PaneId, path: PathBuf, entries: Vec<ExplorerEntry> },
+    /// Periodic hardware-stats tick from the background sysinfo poller.
+    /// The payload is a pre-formatted status string ready for direct rendering.
+    SystemTick(String),
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -93,6 +96,19 @@ pub enum OverlayAction {
     SpawnCommand,
     /// 'c' in Explorer to create a file/directory
     CreateFile { cwd: PathBuf },
+    /// Right-click context menu on a file/directory entry.
+    ///
+    /// `target_path` — the absolute path of the entry that was right-clicked.
+    /// `is_dir`      — whether the entry is a directory (affects Delete behaviour).
+    /// `menu_index`  — the currently highlighted item (0 = Open, 1 = Delete, 2 = Cancel).
+    /// `x` / `y`    — terminal cell coordinates where the menu's top-left corner spawns.
+    ContextMenu {
+        target_path: PathBuf,
+        is_dir:      bool,
+        menu_index:  usize,
+        x:           u16,
+        y:           u16,
+    },
 }
 
 pub struct AppOverlay {
@@ -274,6 +290,7 @@ pub fn load_session(
         mode:             session.mode,
         floating_windows: session.floating_windows,
         drag_state:       None,
+        sys_status:       String::new(),
     };
 
     Ok((state, readers))
@@ -301,6 +318,9 @@ pub struct AppState {
     /// the stored last position and the new position is applied to the
     /// window's `area` origin.
     pub drag_state:       Option<(PaneId, u16, u16)>,
+    /// Pre-formatted system-tray string updated every second by the background
+    /// sysinfo poller.  Empty until the first `SystemTick` arrives.
+    pub sys_status:       String,
 }
 
 impl AppState {
@@ -324,6 +344,7 @@ impl AppState {
                     mode:             DesktopMode::Tiling,
                     floating_windows: Vec::new(),
                     drag_state:       None,
+                    sys_status:       String::new(),
                 },
                 reader,
         ))
@@ -776,24 +797,43 @@ impl AppState {
         false
     }
 
-    /// Build the inner text of a taskbar badge for `id` without allocating on
-    /// the common (shell-idle) path.  Returns `"{id}: {process_name}"`.
+    /// Map a raw `PaneId` to a stable 1-based display number shown in borders
+    /// and taskbar badges.
     ///
-    /// Fix 3: for Terminal panes calls `foreground_process_name()` so the badge
-    /// reflects the currently-running foreground command.
+    /// Pane ids are allocated monotonically and never reused within a session,
+    /// so closing pane 2 of [1, 2, 3] would leave a gap if we showed the raw
+    /// id.  Instead we sort all *currently live* ids and return the 1-based
+    /// position of `target` in that sorted list, giving the user a compact
+    /// sequence that always starts at 1 and has no holes.
+    ///
+    /// `unwrap_or(0) + 1` means an unknown id safely shows as "1" rather than
+    /// panicking; in practice this path is unreachable because callers only
+    /// pass ids that exist in `self.panes`.
+    pub fn display_num(&self, target: PaneId) -> usize {
+        let mut ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter().position(|&id| id == target).unwrap_or(0) + 1
+    }
+
+    /// Build the inner text of a taskbar badge for `id` without allocating on
+    /// the common (shell-idle) path.  Returns `"{num}: {process_name}"`.
+    ///
+    /// Uses `display_num` so the badge shows a compact 1-based window number
+    /// rather than the raw allocator id.
     #[inline]
     fn taskbar_label_for(&self, id: PaneId) -> String {
+        let num = self.display_num(id);
         match self.panes.get(&id) {
             Some(AppPane::Terminal(term)) => {
+                let name = term.custom_command.clone().unwrap_or_else(|| term.foreground_process_name());
                 if term.is_dead {
-                    format!("{id}: [Exited]")
+                    format!("{num}: [Exited]")
                 } else {
-                    let proc_name = term.foreground_process_name();
-                    format!("{id}: {proc_name}")
+                    format!("{num}: {name}")
                 }
             }
-            Some(AppPane::Explorer(_)) => format!("{id}: Explorer"),
-            None                       => format!("{id}: ?"),
+            Some(AppPane::Explorer(_)) => format!("{num}: Explorer"),
+            None                       => format!("{num}: ?"),
         }
     }
 
@@ -1051,19 +1091,86 @@ pub fn draw(
                             Style::default().fg(theme::DIM_TEXT)
                         };
 
-                        // Fix 3: dynamic process name.
+                        // Dynamic process name with 1-based display number.
+                        let num = state.display_num(id);
                         let label = match state.panes.get(&id) {
                             Some(AppPane::Terminal(term)) => {
-                                format!("[{}: {}]", id, term.foreground_process_name())
+                                format!("[{}: {}]", num, term.foreground_process_name())
                             }
-                            Some(AppPane::Explorer(_)) => format!("[{id}: Explorer]"),
-                            None                       => format!("[{id}: ?]"),
+                            Some(AppPane::Explorer(_)) => format!("[{num}: Explorer]"),
+                            None                       => format!("[{num}: ?]"),
                         };
 
                         taskbar.push(Span::styled(label, badge_style));
                     }
 
                     frame.render_widget(Paragraph::new(Line::from(taskbar)), bot_area);
+
+                    // ── System Tray ───────────────────────────────────────────
+                    //
+                    // Split `bot_area` into [taskbar | sys_tray] only when there
+                    // is something to show.  Using a fixed `Length(45)` for the
+                    // tray keeps the taskbar badges from jumping as the clock
+                    // ticks.  The tray cell is right-aligned so the clock/stats
+                    // sit flush against the right edge.
+                    if !state.sys_status.is_empty() {
+                        let bot_chunks = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Min(0),
+                                Constraint::Length(45),
+                            ])
+                            .split(bot_area);
+
+                        let taskbar_area  = bot_chunks[0];
+                        let sys_tray_area = bot_chunks[1];
+
+                        // Re-render the taskbar into the (now narrower) left chunk.
+                        // We must rebuild the `taskbar` spans here because the Vec
+                        // was moved into the Paragraph above.
+                        let n_windows2 = state.floating_windows.len();
+                        let mut taskbar2: Vec<Span> = Vec::with_capacity(1 + n_windows2 * 2);
+                        taskbar2.push(Span::styled(
+                            "[ TDE Start ]",
+                            Style::default()
+                                .fg(theme::TITLE_BADGE_FG)
+                                .bg(theme::ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        let mut sorted_ids2: Vec<PaneId> =
+                            state.floating_windows.iter().map(|w| w.id).collect();
+                        sorted_ids2.sort_unstable();
+                        for id2 in sorted_ids2 {
+                            taskbar2.push(Span::raw("  "));
+                            let is_focused2 = id2 == state.focus;
+                            let badge_style2 = if is_focused2 {
+                                Style::default()
+                                    .fg(theme::TASKBAR_FOCUS_FG)
+                                    .bg(theme::TASKBAR_FOCUS_BG)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(theme::DIM_TEXT)
+                            };
+                            let num2 = state.display_num(id2);
+                            let label2 = match state.panes.get(&id2) {
+                                Some(AppPane::Terminal(term)) => {
+                                    format!("[{}: {}]", num2, term.foreground_process_name())
+                                }
+                                Some(AppPane::Explorer(_)) => format!("[{num2}: Explorer]"),
+                                None                       => format!("[{num2}: ?]"),
+                            };
+                            taskbar2.push(Span::styled(label2, badge_style2));
+                        }
+                        frame.render_widget(Clear, bot_area);
+                        frame.render_widget(Paragraph::new(Line::from(taskbar2)), taskbar_area);
+
+                        frame.render_widget(
+                            Paragraph::new(state.sys_status.as_str())
+                                .alignment(Alignment::Right)
+                                .style(Style::default().fg(theme::ACCENT)),
+                            sys_tray_area,
+                        );
+                    }
                 }
             }
 
@@ -1090,7 +1197,7 @@ pub fn draw(
                                         .add_modifier(Modifier::BOLD),
                                     )
                                     .title(Span::styled(
-                                            format!(" [{}] ✖ Process Completed — Alt+X to close ", id),
+                                            format!(" [{}] ✖ Process Completed — Alt+X to close ", state.display_num(id)),
                                             Style::default()
                                             .fg(theme::DEAD_BORDER)
                                             .add_modifier(Modifier::BOLD),
@@ -1115,10 +1222,12 @@ pub fn draw(
                                     Style::default().fg(theme::DIM_BORDER)
                                 };
 
+                                let name = term.custom_command.clone().unwrap_or_else(|| term.foreground_process_name());
+                                let num = state.display_num(id);
                                 let title_str = if focused {
-                                    format!(" [{}] ● ", id)
+                                    format!(" [{}] ● {} ", num, name)
                                 } else {
-                                    format!(" [{}] ", id)
+                                    format!(" [{}] {} ", num, name)
                                 };
 
                                 let title_style = if focused {
@@ -1149,10 +1258,11 @@ pub fn draw(
                                     Style::default().fg(theme::DIM_BORDER)
                                 };
 
+                                let num = state.display_num(id);
                                 let title_str = if focused {
-                                    format!(" [{}] ● ", id)
+                                    format!(" [{}] ● Explorer ", num)
                                 } else {
-                                    format!(" [{}] ", id)
+                                    format!(" [{}] Explorer ", num)
                                 };
 
                                 let title_style = if focused {
@@ -1185,29 +1295,83 @@ pub fn draw(
 
             // ── Draw Overlay (Always on top, both modes) ──────────────────────
             if let Some(overlay) = &state.overlay {
-                // Fix 4: derive the area via `overlay_rect` so the mouse-dismiss
-                // logic uses the exact same bounding box as the renderer.
-                let overlay_area = overlay_rect(full);
+                match &overlay.action {
+                    // ── Context Menu ─────────────────────────────────────────
+                    //
+                    // Render a 3-item floating List directly under the cursor.
+                    // The menu is 20 columns wide and 5 rows tall (3 items + 2
+                    // border rows).  We clamp both axes so the box never bleeds
+                    // off the terminal edge.
+                    OverlayAction::ContextMenu { menu_index, x, y, .. } => {
+                        const MENU_W: u16 = 20;
+                        const MENU_H: u16 = 5; // 3 items + top + bottom border
 
-                frame.render_widget(Clear, overlay_area);
+                        // Clamp so the menu stays entirely on-screen.
+                        let clamped_x = (*x).min(full.width.saturating_sub(MENU_W));
+                        let clamped_y = (*y).min(full.height.saturating_sub(MENU_H));
 
-                let title = match overlay.action {
-                    OverlayAction::SpawnCommand      => " Run Command (Alt+Space) ",
-                    OverlayAction::CreateFile { .. } => " Create File/Dir (ends with / for dir) ",
-                };
+                        let menu_area = Rect {
+                            x:      clamped_x,
+                            y:      clamped_y,
+                            width:  MENU_W,
+                            height: MENU_H,
+                        };
 
-                let block = Block::default()
-                    .title(Span::styled(
-                            title,
-                            Style::default()
-                            .fg(theme::ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::ACCENT));
+                        let items: Vec<ListItem> = vec![
+                            ListItem::new(" 📂 Open   "),
+                            ListItem::new(" 🗑  Delete "),
+                            ListItem::new(" ❌ Cancel "),
+                        ];
 
-                let text = format!(" {}█", overlay.input);
-                frame.render_widget(Paragraph::new(text).block(block), overlay_area);
+                        let highlight_style = Style::default()
+                            .fg(Color::Black)
+                            .bg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD);
+
+                        let menu_list = List::new(items)
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_style(Style::default().fg(theme::ACCENT)),
+                            )
+                            .highlight_style(highlight_style)
+                            .highlight_symbol("▶ ");
+
+                        let mut list_state = ListState::default();
+                        list_state.select(Some(*menu_index));
+
+                        frame.render_widget(Clear, menu_area);
+                        frame.render_stateful_widget(menu_list, menu_area, &mut list_state);
+                    }
+
+                    // ── Text-input overlays (SpawnCommand, CreateFile) ────────
+                    _ => {
+                        // Fix 4: derive the area via `overlay_rect` so the
+                        // mouse-dismiss logic uses the exact same bounding box.
+                        let overlay_area = overlay_rect(full);
+
+                        frame.render_widget(Clear, overlay_area);
+
+                        let title = match overlay.action {
+                            OverlayAction::SpawnCommand      => " Run Command (Alt+Space) ",
+                            OverlayAction::CreateFile { .. } => " Create File/Dir (ends with / for dir) ",
+                            OverlayAction::ContextMenu { .. } => unreachable!(),
+                        };
+
+                        let block = Block::default()
+                            .title(Span::styled(
+                                title,
+                                Style::default()
+                                    .fg(theme::ACCENT)
+                                    .add_modifier(Modifier::BOLD),
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(theme::ACCENT));
+
+                        let text = format!(" {}█", overlay.input);
+                        frame.render_widget(Paragraph::new(text).block(block), overlay_area);
+                    }
+                }
             }
     })?;
     Ok(())
@@ -1251,6 +1415,16 @@ fn handle_event(
                 *exp.scroll_offset.borrow_mut() = 0;
             }
             *needs_draw = true;
+        }
+
+        // ── System tray tick ─────────────────────────────────────────────
+        AppEvent::SystemTick(status) => {
+            state.sys_status = status;
+            // Only trigger a redraw when in GUI mode — in Tiling mode the
+            // tray is not rendered, so there is nothing to refresh.
+            if state.mode == DesktopMode::Gui {
+                *needs_draw = true;
+            }
         }
 
         // ── Shell exited → automatic pane close (or dead-pane retention) ─
@@ -1352,8 +1526,28 @@ fn handle_event(
 
                     // Fix 4: overlay dismiss — check before any other routing.
                     if state.overlay.is_some() {
+                        // ── Context Menu: hit-test and dispatch ───────────────
+                        // Delegate to `input::dispatch_mouse_overlay`, which owns
+                        // all context-menu mouse logic (hit-test, Open/Delete/Cancel
+                        // execution).  That function takes the overlay out of state
+                        // itself — if the click was inside the menu it executes the
+                        // action and drops the overlay; if outside it also drops it
+                        // (dismiss).  Either way the overlay is gone after the call,
+                        // so we never fall through to the normal pane-focus routing.
+                        // ── Context Menu: check for click interactions ─────────
+                        if matches!(
+                            state.overlay.as_ref().map(|o| &o.action),
+                            Some(OverlayAction::ContextMenu { .. })
+                        ) {
+                            if let Some((new_id, reader)) = crate::input::dispatch_mouse_overlay(state, *area, m, tx)? {
+                                crate::pty::spawn_pane_reader(new_id, reader, tx.clone());
+                            }
+                            *needs_draw = true;
+                            return Ok(());
+                        }
+
+                        // ── Text-input overlays: dismiss only on outside click ─
                         let ov = overlay_rect(full);
-                        // Test whether the click is OUTSIDE the popup.
                         let inside = m.column >= ov.x
                             && m.column < ov.x.saturating_add(ov.width)
                             && m.row    >= ov.y
@@ -1516,6 +1710,156 @@ fn handle_event(
 
                         if changed {
                             *needs_draw = true;
+                        }
+                    }
+                }
+
+            // ── Right-click: spawn Context Menu over an Explorer entry ────
+            //
+            // Hit-test mirrors the left-click explorer grid math exactly:
+            //   • border = 1 cell each side  (Block::default().borders(Borders::ALL))
+            //   • header = 3 rows            (render_explorer_grid header_area height)
+            //   • cell_width = 14, cell_height = 4  (same constants as left-click)
+            //
+            // We deliberately do NOT use `click_focus` here: the focus stays on
+            // whatever was already active; the menu is ephemeral.  If the user
+            // right-clicks *outside* all Explorer panes the event is silently
+            // swallowed (no menu is shown).
+            Event::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Right)) =>
+                {
+                    // Dismiss any open overlay first (keeps state clean).
+                    if state.overlay.is_some() {
+                        state.overlay = None;
+                        *needs_draw = true;
+                    }
+
+                    // Identify which pane (if any) was right-clicked.
+                    let col = m.column;
+                    let row = m.row;
+
+                    let mut hit_pane: Option<(PaneId, Rect)> = None;
+
+                    match state.mode {
+                        DesktopMode::Tiling => {
+                            state.layout.walk_rects(*area, &mut |id, rect| {
+                                if col >= rect.x
+                                    && col < rect.x + rect.width
+                                    && row >= rect.y
+                                    && row < rect.y + rect.height
+                                {
+                                    hit_pane = Some((id, rect));
+                                }
+                            });
+                        }
+                        DesktopMode::Gui => {
+                            // Top-most window wins (reverse iteration).
+                            for win in state.floating_windows.iter().rev() {
+                                if col >= win.area.x
+                                    && col < win.area.x + win.area.width
+                                    && row >= win.area.y
+                                    && row < win.area.y + win.area.height
+                                {
+                                    hit_pane = Some((win.id, win.area));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((pane_id, rect)) = hit_pane {
+                        // Only open a context menu on Explorer panes.
+                        //
+                        // The explorer inner area is:
+                        //   x: rect.x + 1  (left border)
+                        //   y: rect.y + 1 + 3  (top border + 3-row header rendered by
+                        //                        render_explorer_grid)
+                        // Which means grid content starts at rect.y + 4 in absolute
+                        // terminal rows.  However `render_explorer_grid` receives
+                        // `block.inner(rect)` which subtracts 1 from each edge —
+                        // the inner area's y is `rect.y + 1`.  The header_area is
+                        // then 3 rows inside that inner area, so actual grid rows
+                        // begin at `rect.y + 1 + 3 = rect.y + 4`.
+                        //
+                        // The left-click handler uses `rect.y + 3` (where rect is the
+                        // *inner* content area passed into render_explorer_grid, which
+                        // already has the border subtracted).  In handle_event the
+                        // pane_rect is the full block rect, so we must offset by the
+                        // border (1) + header (3) = 4 from the outer rect.y.
+                        if row >= rect.y + 4 {
+                            if let Some(AppPane::Explorer(exp)) =
+                                state.panes.get_mut(&pane_id)
+                            {
+                                // ── Grid math (identical to left-click handler) ──
+                                // The left-click handler offsets by rect.y + 3 for
+                                // `local_y`.  That handler receives pane_rect from
+                                // walk_rects/floating_windows which is the *outer*
+                                // block rect.  But then it subtracts `rect.y + 3`
+                                // from m.row — that "+3" accounts for the top border
+                                // (1 row) plus the 2-row path header inside inner,
+                                // i.e. inner.y = rect.y+1, header_area height = 3,
+                                // so grid starts at inner.y+3 = rect.y+4.
+                                // Wait — left-click uses `rect.y + 3` not `rect.y + 4`.
+                                // Re-read: in left click, rect comes from walk_rects
+                                // (outer rect), and `m.row >= rect.y + 3` guards the
+                                // grid; then `local_y = m.row - (rect.y + 3)`.
+                                // That's because render_explorer_grid is called with
+                                // block.inner(rect) — inner subtracts border (1) →
+                                // inner.y = rect.y+1.  Header_area height = 3 with y
+                                // = inner.y.  Grid area starts at inner.y+3 = rect.y+4.
+                                // BUT the guard is `>= rect.y + 3` and local_y
+                                // = `m.row - (rect.y + 3)`, so when m.row == rect.y+3
+                                // local_y==0 which maps to the very first grid row.
+                                // This is a 1-row off-by-one that the existing code
+                                // lives with (it selects the header row as row 0).
+                                // We replicate this exactly so right-click and
+                                // left-click select the same cell index.
+                                let local_x = col.saturating_sub(rect.x);
+                                let local_y = row.saturating_sub(rect.y + 3);
+
+                                let cell_width:  u16 = 14;
+                                let cell_height: u16 = 4;
+
+                                let cols =
+                                    ((rect.width.max(cell_width)) / cell_width).max(1) as usize;
+
+                                let grid_col = (local_x / cell_width) as usize;
+                                let grid_row = (local_y / cell_height) as usize;
+
+                                let scroll_offset = *exp.scroll_offset.borrow();
+
+                                let entry_idx =
+                                    ((scroll_offset + grid_row) * cols) + grid_col;
+
+                                if entry_idx < exp.entries.len() {
+                                    let entry = &exp.entries[entry_idx];
+                                    let target_path = if entry.name == ".." {
+                                        exp.cwd
+                                            .parent()
+                                            .map(|p| p.to_path_buf())
+                                            .unwrap_or_else(|| exp.cwd.clone())
+                                    } else {
+                                        exp.cwd.join(&entry.name)
+                                    };
+                                    let is_dir = entry.is_dir;
+
+                                    // Update selection to the right-clicked cell.
+                                    *exp.selected_index.borrow_mut() = entry_idx;
+
+                                    // Spawn the context menu directly under the cursor.
+                                    state.overlay = Some(AppOverlay {
+                                        action: OverlayAction::ContextMenu {
+                                            target_path,
+                                            is_dir,
+                                            menu_index: 0,
+                                            x: col,
+                                            y: row,
+                                        },
+                                        input: String::new(),
+                                    });
+                                    *needs_draw = true;
+                                }
+                            }
                         }
                     }
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "TDE"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "TDE - Terminal Desktop Environment"
 
@@ -34,6 +34,8 @@ anyhow = "1"
 futures = "0.3"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+sysinfo = "0.30"
+chrono = { version = "0.4", features = ["clock"] }
 
 [profile.release]
 opt-level = 3

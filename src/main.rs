@@ -8,12 +8,14 @@
 //!             mode: DesktopMode, floating_windows: Vec<FloatingWindow> }
 //!
 //!  AppEvent::{PtyOutput{pane_id,bytes}, PtyExited{pane_id},
-//!             Input(Event), ExplorerUpdate{pane_id,path,entries}}
+//!             Input(Event), ExplorerUpdate{pane_id,path,entries},
+//!             SystemTick(String)}
 //!
 //!  run_event_loop()
 //!   ├─ PtyOutput      → parser.process()   → draw()
 //!   ├─ PtyExited      → close_pane()       → draw()   [or quit if last]
 //!   ├─ ExplorerUpdate → exp.entries = ...  → draw()
+//!   ├─ SystemTick     → state.sys_status   → draw()   (GUI mode only)
 //!   └─ Input          → dispatch_input()   → draw()
 //!        ├─ Alt+G  → toggle_gui_mode()         (Phase 5)
 //!        ├─ Alt+V/S → do_split()
@@ -173,6 +175,56 @@ async fn main() -> Result<()> {
 
     let tx_input = tx.clone();
     tokio::spawn(async move { input_task(tx_input).await });
+
+    // ── Background system-stats poller ────────────────────────────────────────
+    //
+    // Runs in its own Tokio task so it never blocks the UI thread.
+    // Sends `AppEvent::SystemTick` once per second.  If the receiver has been
+    // dropped (app is shutting down) the send fails and the loop exits cleanly.
+    //
+    // sysinfo requires one initial `refresh_cpu_usage()` call before the first
+    // meaningful reading because CPU% is computed as a delta between two samples.
+    // We therefore sleep *before* the first formatted send, not after.
+    let tx_sys = tx.clone();
+    tokio::spawn(async move {
+        use sysinfo::System;
+
+        let mut sys = System::new();
+        // Prime the CPU delta — the first reading is always 0% without this.
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+            sys.refresh_cpu_usage();
+            sys.refresh_memory();
+
+            // Average CPU% across all logical cores.
+            let cpu_pct = {
+                let cpus = sys.cpus();
+                if cpus.is_empty() {
+                    0.0_f32
+                } else {
+                    cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32
+                }
+            };
+
+            // RAM in GiB (used / total, both in bytes from sysinfo).
+            let ram_used_gb  = sys.used_memory()  as f64 / 1_073_741_824.0;
+            let ram_total_gb = sys.total_memory() as f64 / 1_073_741_824.0;
+
+            let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
+
+            let status = format!(
+                "[ 💻 CPU: {cpu_pct:.0}% | 🧠 RAM: {ram_used_gb:.1}/{ram_total_gb:.1}G | 🕒 {time_str} ]"
+            );
+
+            if tx_sys.send(AppEvent::SystemTick(status)).await.is_err() {
+                break; // Receiver dropped — app is shutting down.
+            }
+        }
+    });
 
     run_event_loop(&mut terminal, &mut state, content_area, &mut rx, &tx).await?;
 

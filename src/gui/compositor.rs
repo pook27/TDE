@@ -90,20 +90,23 @@ pub fn draw_gui(frame: &mut Frame, state: &AppState, full_area: Rect) {
         };
 
         let title_str = match pane {
-            AppPane::Terminal(_) => {
+            AppPane::Terminal(term) => {
+                let name = term.custom_command.clone().unwrap_or_else(|| "Terminal".to_string());
+                let num = state.display_num(win.id);
                 if is_dead {
-                    format!(" [{}] ✖ Process Completed — Alt+X to close ", win.id)
+                    format!(" [{}] ✖ Process Completed — Alt+X to close ", num)
                 } else if focused {
-                    format!(" [{}] ● Terminal ", win.id)
+                    format!(" [{}] ● {} ", num, name)
                 } else {
-                    format!(" [{}] Terminal ", win.id)
+                    format!(" [{}] {} ", num, name)
                 }
             }
             AppPane::Explorer(_) => {
+                let num = state.display_num(win.id);
                 if focused {
-                    format!(" [{}] ● Explorer ", win.id)
+                    format!(" [{}] ● Explorer ", num)
                 } else {
-                    format!(" [{}] Explorer ", win.id)
+                    format!(" [{}] Explorer ", num)
                 }
             }
         };
