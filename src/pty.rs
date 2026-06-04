@@ -114,7 +114,7 @@ impl TerminalPane {
             Err(e) => {
                 // If the command is misspelled, don't crash TDE! 
                 // Spawn a fallback shell to display the error directly inside the pane.
-                let err_msg = format!("TDE Error: Failed to spawn command.\r\n{}\r\n\r\nPress Enter to close.", e);
+                let err_msg = format!("TDE Error: Failed to spawn command.\r\n{}\r\n\r\nPress Alt+X to close.", e);
                 let safe_msg = err_msg.replace('\'', "'\\''");
                 
                 let mut fallback = CommandBuilder::new("sh");
